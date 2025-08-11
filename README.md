@@ -115,8 +115,22 @@ We provide several variants for each of the components in the unlearning pipelin
 conda create -n unlearning python=3.11
 conda activate unlearning
 pip install .[lm_eval]
-pip install --no-build-isolation flash-attn==2.6.3
 
+#need to install nvcc if do not have nvcc toolkit
+conda install -c nvidia cuda-toolkit=12.1 -y
+
+#set environment variable
+export CUDA_HOME="$CONDA_PREFIX"
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$LD_LIBRARY_PATH"
+
+#confirm
+nvcc --version
+echo $CUDA_HOME
+
+
+pip install --no-build-isolation flash-attn==2.6.3
+#need to install nvcc first
 # Data setup
 python setup_data.py --eval # saves/eval now contains evaluation results of the uploaded models
 # This downloads log files with evaluation results (including retain model logs)
