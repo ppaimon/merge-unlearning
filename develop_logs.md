@@ -18,4 +18,6 @@ add data preparation of /scratch/wangtiantong/PUM/data/idk.jsonl in readme
 
 run the baseline tofu_unlearn.sh for llama 3.2 1B model with all baseline methods and splits
 
+add postcheck and task finish status check in scripts/tofu_unlearn.sh to avoid multiple running
+
 

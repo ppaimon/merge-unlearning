@@ -1,0 +1,1 @@
+Can run PUM methods by only changing the variable trainers_experiments in the sh file. Remember to write corresponding yaml files and Registering in /scratch/wangtiantong/PUM/src/trainer/__init__.py
