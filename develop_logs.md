@@ -5,6 +5,9 @@
 
 add /scratch/wangtiantong/PUM/src/utils/hyperplane_perturb.py for model noise pertubation
 
+add /scratch/wangtiantong/PUM/src/trainer/unlearn/grad_ascent_pum.py to integrate PUM with GA method
+
+changed readme for environment settings and PUM scripts running.
 
 
 2025.8.26
