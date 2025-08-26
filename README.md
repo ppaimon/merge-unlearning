@@ -137,6 +137,16 @@ python setup_data.py --eval # saves/eval now contains evaluation results of the 
 # into `saves/eval`, used for evaluating unlearning across supported benchmarks.
 # Additional datasets (e.g., WMDP) are supported — run below for options:
 # python setup_data.py --help
+
+
+#
+# 在 open-unlearning 仓库的根目录执行
+mkdir -p data
+curl -L https://huggingface.co/datasets/open-unlearning/idk/raw/main/idk.jsonl -o data/idk.jsonl
+# 简单校验
+head -n 1 data/idk.jsonl
+wc -l data/idk.jsonl
+
 ```
 
 ---
