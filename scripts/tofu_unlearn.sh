@@ -58,8 +58,8 @@ fi
 # 6) 网格设置
 ##########################################
 models=(
-  "Llama-3.2-1B-Instruct"
-  # "Llama-3.2-3B-Instruct"
+  # "Llama-3.2-1B-Instruct"
+  "Llama-3.2-3B-Instruct"
   # "Llama-3.1-8B-Instruct"
 )
 trainers_experiments=(
