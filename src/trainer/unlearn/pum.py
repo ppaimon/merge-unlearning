@@ -120,6 +120,7 @@ class PUM(FinetuneTrainer):
         eta_srv: float = 1.0,
         local_epochs: int = 1,
         local_max_steps: Optional[int] = None,
+        auto_balance_local_max_steps: bool = False,
         clip_update_norm: Optional[float] = None,
         use_orthogonal_reparam: bool = False,  # placeholder (identity by default)
         # base trainer args
@@ -140,6 +141,7 @@ class PUM(FinetuneTrainer):
         self.local_max_steps = (
             int(local_max_steps) if local_max_steps is not None else None
         )
+        self.auto_balance_local_max_steps = bool(auto_balance_local_max_steps)
         self.clip_update_norm = clip_update_norm
         self.use_orthogonal_reparam = use_orthogonal_reparam
 
@@ -155,19 +157,239 @@ class PUM(FinetuneTrainer):
         self._base_seed = int(self.args.seed or 0)
 
     # ----------------------------
+    # Step budget alignment
+    # ----------------------------
+    def _maybe_set_auto_local_max_steps(self) -> None:
+        """If requested, set local_max_steps so that local_max_steps * rounds_R ~= N,
+        where N is the total training steps of the original single-trainer run.
+
+        N = num_train_epochs * ceil(len(train_dataset) / (bs * accum * world_size))
+        """
+        if self.local_max_steps is not None or not self.auto_balance_local_max_steps:
+            return
+
+        try:
+            dataset_len = len(self.train_dataset)
+        except Exception:
+            dataset_len = None
+
+        if not dataset_len or dataset_len <= 0:
+            logger.warning("PUM: cannot infer dataset length; skip auto-balance of local_max_steps")
+            return
+
+        bs = int(self.args.per_device_train_batch_size)
+        accum = int(self.args.gradient_accumulation_steps or 1)
+        world = 1
+        # Prefer TrainingArguments' derived world size, fallback to env
+        try:
+            world = int(getattr(self.args, "world_size", None) or int(os.environ.get("WORLD_SIZE", 1)))
+        except Exception:
+            world = 1
+
+        # Prefer explicit max_steps if provided; else derive from epochs and steps/epoch
+        explicit_max_steps = int(getattr(self.args, "max_steps", -1) or -1)
+        if explicit_max_steps > 0:
+            N = explicit_max_steps
+            steps_per_epoch = None
+            epochs = None
+        else:
+            steps_per_epoch = math.ceil(dataset_len / max(bs * accum * world, 1))
+            epochs = int(getattr(self.args, "num_train_epochs", 1))
+            N = steps_per_epoch * max(epochs, 1)
+        # local_max_steps * rounds_R ~= N
+        self.local_max_steps = max(1, math.ceil(N / max(self.rounds_R, 1)))
+        logger.info(
+            f"PUM auto-balance: dataset_len={dataset_len}, bs={bs}, accum={accum}, world={world}, "
+            f"steps_per_epoch={steps_per_epoch}, epochs={epochs}, explicit_max_steps={explicit_max_steps} -> N={N}; "
+            f"rounds_R={self.rounds_R} -> local_max_steps={self.local_max_steps} (per copy, per round)"
+        )
+
+    # ----------------------------
     # Orthogonal reparam (placeholders)
     # ----------------------------
     def _sample_T(self, model: nn.Module, seed: int):
-        # Placeholder: identity transform; return opaque handle if needed
-        return None
+        """
+        Sample a per-layer transform T = {layer_idx: {R_sub, perm, inv_perm, dims}}
+        - Attention: a shared orthogonal R_sub in head_dim applied per head (q,k,v left-mul; o right-mul)
+        - FFN: a permutation P over the intermediate width (gate/up left-mul; down right-mul)
+
+        The transform strictly preserves function for Llama-style architectures.
+        """
+        if not self.use_orthogonal_reparam:
+            return None
+
+        torch.manual_seed(seed)
+        T: Dict[int, Dict[str, torch.Tensor]] = {}
+        # Try to access Llama-style modules
+        try:
+            layers = model.model.layers  # type: ignore[attr-defined]
+        except Exception:
+            # Unknown model layout; disable reparam safely
+            return None
+
+        for li, layer in enumerate(layers):
+            # Attention dims
+            attn = getattr(layer, "self_attn", None)
+            mlp = getattr(layer, "mlp", None)
+            entry: Dict[str, torch.Tensor] = {}
+            if attn is not None:
+                # Use a single orthogonal over head_dim, repeated across heads
+                head_dim = int(getattr(attn, "head_dim", 0) or (attn.q_proj.weight.shape[0] // getattr(attn, "num_heads", 1)))
+                if head_dim > 0:
+                    # Random orthogonal via QR
+                    A = torch.randn(head_dim, head_dim, device=attn.q_proj.weight.device, dtype=attn.q_proj.weight.dtype)
+                    # Ensure well-conditioned
+                    Q, _ = torch.linalg.qr(A)
+                    entry["R_sub"] = Q.detach().to(attn.q_proj.weight.dtype)
+                    # Store head counts for reshape logic
+                    entry["n_q_heads"] = torch.tensor(int(getattr(attn, "num_heads", 0)), device="cpu")
+                    entry["n_kv_heads"] = torch.tensor(int(getattr(attn, "num_key_value_heads", getattr(attn, "num_heads", 0))), device="cpu")
+                    entry["head_dim"] = torch.tensor(head_dim, device="cpu")
+
+            if mlp is not None:
+                # Intermediate size inferred from up_proj weight
+                inter = int(mlp.up_proj.weight.shape[0])
+                perm = torch.randperm(inter, device=mlp.up_proj.weight.device)
+                inv_perm = torch.empty_like(perm)
+                inv_perm[perm] = torch.arange(inter, device=perm.device)
+                entry["perm"] = perm
+                entry["inv_perm"] = inv_perm
+
+            if entry:
+                T[li] = entry
+
+        return T if len(T) > 0 else None
 
     def _apply_T(self, model: nn.Module, T) -> None:
-        # Identity: no-op. Future: implement per-layer orthogonal/permutation transforms.
-        return
+        if not T:
+            return
+        try:
+            layers = model.model.layers  # type: ignore[attr-defined]
+        except Exception:
+            return
+
+        for li, layer in enumerate(layers):
+            if li not in T:
+                continue
+            ent = T[li]
+            attn = getattr(layer, "self_attn", None)
+            mlp = getattr(layer, "mlp", None)
+
+            # Attention block: apply R_sub per head (left mul on q/k/v; right mul on o)
+            if attn is not None and "R_sub" in ent:
+                R = ent["R_sub"]
+                D = int(ent["head_dim"].item())
+                Hq = int(ent["n_q_heads"].item())
+                Hkv = int(ent["n_kv_heads"].item())
+
+                def _left_mul_block(weight: torch.Tensor, H: int, D: int, R: torch.Tensor):
+                    # weight: (H*D, M) -> reshape (H,D,M), apply R @ (D,M) per-head
+                    w = weight.view(H, D, -1)
+                    w = torch.einsum("ij,hjm->him", R, w)
+                    return w.reshape(H * D, -1)
+
+                def _right_mul_block(weight: torch.Tensor, H: int, D: int, R: torch.Tensor):
+                    # weight: (M, H*D) -> reshape (M,H,D), apply (M,H,D) @ R^T on last dim
+                    w = weight.view(-1, H, D)
+                    w = torch.einsum("mhd,dj->mhj", w, R.T)
+                    return w.reshape(-1, H * D)
+
+                with torch.no_grad():
+                    attn.q_proj.weight.copy_(
+                        _left_mul_block(attn.q_proj.weight, Hq, D, R)
+                    )
+                    attn.k_proj.weight.copy_(
+                        _left_mul_block(attn.k_proj.weight, Hkv, D, R)
+                    )
+                    attn.v_proj.weight.copy_(
+                        _left_mul_block(attn.v_proj.weight, Hkv, D, R)
+                    )
+                    attn.o_proj.weight.copy_(
+                        _right_mul_block(attn.o_proj.weight, Hq, D, R)
+                    )
+
+            # FFN block: permutation over intermediate width
+            if mlp is not None and "perm" in ent and "inv_perm" in ent:
+                P = ent["perm"].long()
+                with torch.no_grad():
+                    # gate/up: left-multiply by P -> row reindex
+                    mlp.gate_proj.weight.copy_(mlp.gate_proj.weight[P, :])
+                    mlp.up_proj.weight.copy_(mlp.up_proj.weight[P, :])
+                    # LLaMA MLPs typically are bias=False, but handle if exists
+                    if getattr(mlp.gate_proj, "bias", None) is not None:
+                        mlp.gate_proj.bias.copy_(mlp.gate_proj.bias[P])
+                    if getattr(mlp.up_proj, "bias", None) is not None:
+                        mlp.up_proj.bias.copy_(mlp.up_proj.bias[P])
+                    # down: right-multiply by P^T -> column reindex by inv_perm
+                    invP = ent["inv_perm"].long()
+                    mlp.down_proj.weight.copy_(mlp.down_proj.weight[:, invP])
 
     def _apply_T_inv_to_update(self, update: Dict[str, torch.Tensor], T) -> Dict[str, torch.Tensor]:
-        # Identity for now
-        return update
+        if not T:
+            return update
+
+        out: Dict[str, torch.Tensor] = dict(update)
+
+        def _maybe(name: str):
+            return name in out and isinstance(out[name], torch.Tensor)
+
+        for li, ent in T.items():
+            # Build common name prefix for this layer
+            base = f"model.layers.{li}."
+
+            # Attention inverse: q/k/v were left-multiplied by R -> delta preimage = R^T @ delta
+            # o was right-multiplied by R^T -> delta preimage = delta @ R
+            if "R_sub" in ent:
+                R = ent["R_sub"]
+                D = int(ent["head_dim"].item())
+                Hq = int(ent["n_q_heads"].item())
+                Hkv = int(ent["n_kv_heads"].item())
+
+                def _left_inv(weight: torch.Tensor, H: int, D: int, R: torch.Tensor):
+                    w = weight.view(H, D, -1)
+                    w = torch.einsum("ij,hjm->him", R.T, w)
+                    return w.reshape(H * D, -1)
+
+                def _right_inv(weight: torch.Tensor, H: int, D: int, R: torch.Tensor):
+                    w = weight.view(-1, H, D)
+                    w = torch.einsum("mhd,dj->mhj", w, R)
+                    return w.reshape(-1, H * D)
+
+                q_w = base + "self_attn.q_proj.weight"
+                k_w = base + "self_attn.k_proj.weight"
+                v_w = base + "self_attn.v_proj.weight"
+                o_w = base + "self_attn.o_proj.weight"
+                if _maybe(q_w):
+                    out[q_w] = _left_inv(out[q_w], Hq, D, R)
+                if _maybe(k_w):
+                    out[k_w] = _left_inv(out[k_w], Hkv, D, R)
+                if _maybe(v_w):
+                    out[v_w] = _left_inv(out[v_w], Hkv, D, R)
+                if _maybe(o_w):
+                    out[o_w] = _right_inv(out[o_w], Hq, D, R)
+
+            # FFN inverse: gate/up were left-multiplied by P -> delta preimage = P^T rows
+            # down was right-multiplied by P^T -> delta preimage = columns by P
+            if "perm" in ent and "inv_perm" in ent:
+                P = ent["perm"].long()
+                invP = ent["inv_perm"].long()
+                g_w = base + "mlp.gate_proj.weight"
+                u_w = base + "mlp.up_proj.weight"
+                d_w = base + "mlp.down_proj.weight"
+                g_b = base + "mlp.gate_proj.bias"
+                u_b = base + "mlp.up_proj.bias"
+                if _maybe(g_w):
+                    out[g_w] = out[g_w][invP, :]
+                if _maybe(u_w):
+                    out[u_w] = out[u_w][invP, :]
+                if _maybe(g_b):
+                    out[g_b] = out[g_b][invP]
+                if _maybe(u_b):
+                    out[u_b] = out[u_b][invP]
+                if _maybe(d_w):
+                    out[d_w] = out[d_w][:, P]
+
+        return out
 
     # ----------------------------
     # Helpers
@@ -223,6 +445,9 @@ class PUM(FinetuneTrainer):
     def train(self, resume_from_checkpoint: Optional[str] = None, **kwargs):
         self.model.train()
 
+        # Optionally set local_max_steps to match original total steps budget
+        self._maybe_set_auto_local_max_steps()
+
         for r in range(1, self.rounds_R + 1):
             # Draw zero-sum base noises
             base_noises = _generate_zero_sum_noises(self.model, self.copies_m, self.sigma)
@@ -257,6 +482,9 @@ class PUM(FinetuneTrainer):
                 # Apply reparameterization (identity now)
                 self._apply_T(model_k, T_k)
 
+                # Snapshot pre-training params in transformed coordinate
+                before_sd = _state_dict_tensors(model_k)
+
                 # Build inner args and inner trainer
                 inner_out_dir = os.path.join(
                     str(self.args.output_dir), f"pum_round{r}_copy{k+1}"
@@ -267,20 +495,9 @@ class PUM(FinetuneTrainer):
                 # Local unlearning train
                 inner_trainer.train()
 
-                # Compute update: Delta^{(k,r)} = theta_k_after - (theta_{r-1} + eps_k)
+                # Compute update in transformed coords: Delta^{(k,r)} = theta_k_after - theta_k_before
                 after_sd = _state_dict_tensors(inner_trainer.model)
-                base_plus_eps = {
-                    n: p.detach().clone().to(v.device)
-                    for (n, v), (_, p) in zip(after_sd.items(), _named_params(self.model))
-                }
-                for n in base_plus_eps:
-                    # base model param
-                    base_plus_eps[n] = self.model.get_parameter(n).detach().clone().to(
-                        after_sd[n].device
-                    )
-                    base_plus_eps[n].add_(eps_k[n].to(base_plus_eps[n].device))
-
-                delta_k = _diff_state_dict(after_sd, base_plus_eps)  # aligned with model_k coords
+                delta_k = _diff_state_dict(after_sd, before_sd)
 
                 # Invert T (identity for now)
                 delta_k = self._apply_T_inv_to_update(delta_k, T_k)
@@ -297,7 +514,7 @@ class PUM(FinetuneTrainer):
                 # Free up memory explicitly
                 del inner_trainer
                 del model_k
-                del after_sd, base_plus_eps, delta_k
+                del after_sd, delta_k
                 torch.cuda.empty_cache()
 
             # Aggregate and apply to global model: theta_r = theta_{r-1} + eta_srv * (S1 / S0)
@@ -310,4 +527,3 @@ class PUM(FinetuneTrainer):
         # End of rounds; switch to eval mode for downstream evaluate()
         self.model.eval()
         return None
-

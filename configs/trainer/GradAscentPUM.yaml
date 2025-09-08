@@ -14,5 +14,6 @@ method_args:
   eta_srv: 1.0         # server update scale for aggregated delta
   local_epochs: 1      # local unlearning epochs per copy
   local_max_steps: null  # optional max steps per copy (overrides epochs if set)
+  auto_balance_local_max_steps: true # auto-set local_max_steps so local_max_steps * rounds_R ~= original N
   clip_update_norm: null # optional global l2 clip on each copy's delta
   use_orthogonal_reparam: false # enable when orthogonal/permutation transforms are implemented
