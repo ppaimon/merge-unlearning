@@ -92,14 +92,14 @@ fi
 # 模型（默认仅启用 3B；如需 1B/8B 打开注释）
 MODELS=(
   # "Llama-3.2-1B-Instruct"
-  "Llama-3.2-3B-Instruct"
+  # "Llama-3.2-3B-Instruct"
   "Llama-3.1-8B-Instruct"
 )
 
 # 方法-实验配置对（DPO 使用 unlearn/tofu/idk.yaml）
 TRAINERS_EXPERIMENTS=(
-  "GradAscent unlearn/tofu/default.yaml"
-  "GradDiff   unlearn/tofu/default.yaml"
+  # "GradAscent unlearn/tofu/default.yaml"
+  # "GradDiff   unlearn/tofu/default.yaml"
   "NPO        unlearn/tofu/default.yaml"
   "DPO        unlearn/tofu/idk.yaml"
   # "RMU        unlearn/tofu/default.yaml"
@@ -107,8 +107,8 @@ TRAINERS_EXPERIMENTS=(
 
 # 数据 split（forget/holdout/retain）
 SPLITS=(
-  "forget01 holdout01 retain99"
-  "forget05 holdout05 retain95"
+  # "forget01 holdout01 retain99"
+  # "forget05 holdout05 retain95"
   "forget10 holdout10 retain90"
 )
 

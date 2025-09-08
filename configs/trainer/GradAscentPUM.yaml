@@ -1,3 +1,18 @@
 defaults:
   - finetune
-handler: GradAscentPUM
+
+# Generic PUM orchestrator wrapping the GradAscent inner method
+handler: PUM
+method_args:
+  inner_handler: GradAscent
+  # PUM hyperparameters
+  copies_m: 4          # number of perturbed copies per round (m)
+  rounds_R: 1          # number of PUM rounds (R)
+  sigma: 0.0           # Gaussian noise std (per-parameter); 0.0 disables perturbation
+  alpha_min: 1.0       # lower bound for secret scaling
+  alpha_max: 1.0       # upper bound for secret scaling
+  eta_srv: 1.0         # server update scale for aggregated delta
+  local_epochs: 1      # local unlearning epochs per copy
+  local_max_steps: null  # optional max steps per copy (overrides epochs if set)
+  clip_update_norm: null # optional global l2 clip on each copy's delta
+  use_orthogonal_reparam: false # enable when orthogonal/permutation transforms are implemented

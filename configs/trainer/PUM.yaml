@@ -1,0 +1,19 @@
+defaults:
+  - finetune
+
+# Generic PUM orchestrator wrapping any inner unlearning method
+handler: PUM
+method_args:
+  inner_handler: GradAscent   # override to GradDiff/NPO/DPO/RMU/UNDIAL/CEU/SatImp/WGA/PDU
+  inner_method_args: {}       # optional kwargs forwarded to inner handler
+  copies_m: 4                 # number of perturbed copies per round (m)
+  rounds_R: 1                 # number of PUM rounds (R)
+  sigma: 0.0                  # Gaussian noise std (per-parameter); 0.0 disables perturbation
+  alpha_min: 1.0              # lower bound for secret scaling
+  alpha_max: 1.0              # upper bound for secret scaling
+  eta_srv: 1.0                # server update scale for aggregated delta
+  local_epochs: 1             # local unlearning epochs per copy
+  local_max_steps: null       # optional max steps per copy (overrides epochs if set)
+  clip_update_norm: null      # optional global l2 clip on each copy's delta
+  use_orthogonal_reparam: false  # identity by default; safe to enable once implemented
+
