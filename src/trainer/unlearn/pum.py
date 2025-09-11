@@ -2,6 +2,7 @@ import os
 import math
 import copy
 import importlib
+import logging
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -9,6 +10,8 @@ from torch import nn
 
 from transformers import TrainingArguments
 from trainer.base import FinetuneTrainer
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_inner_trainer(handler_name: str):
@@ -115,6 +118,12 @@ class PUM(FinetuneTrainer):
         copies_m: int = 4,
         rounds_R: int = 1,
         sigma: float = 0.0,
+        # DP-based noise calibration (single-sigma across layers)
+        dp_epsilon: Optional[float] = None,
+        dp_delta: Optional[float] = None,
+        dp_sensitivity_total_l2: Optional[float] = None,
+        dp_rdp_orders: Optional[List[float]] = None,
+        dp_use_worstcase_alpha: bool = True,
         alpha_min: float = 1.0,
         alpha_max: float = 1.0,
         eta_srv: float = 1.0,
@@ -134,6 +143,16 @@ class PUM(FinetuneTrainer):
         self.copies_m = int(copies_m)
         self.rounds_R = int(rounds_R)
         self.sigma = float(sigma)
+        # DP args
+        self.dp_epsilon = float(dp_epsilon) if dp_epsilon is not None else None
+        self.dp_delta = float(dp_delta) if dp_delta is not None else None
+        self.dp_sens_tot_l2 = (
+            float(dp_sensitivity_total_l2) if dp_sensitivity_total_l2 is not None else None
+        )
+        self.dp_rdp_orders = (
+            list(dp_rdp_orders) if dp_rdp_orders is not None else None
+        )
+        self.dp_use_worstcase_alpha = bool(dp_use_worstcase_alpha)
         self.alpha_min = float(alpha_min)
         self.alpha_max = float(alpha_max)
         self.eta_srv = float(eta_srv)
@@ -155,6 +174,74 @@ class PUM(FinetuneTrainer):
 
         # Seed per-round/copy deterministically for reproducibility across ranks
         self._base_seed = int(self.args.seed or 0)
+
+    # ----------------------------
+    # DP calibration for sigma
+    # ----------------------------
+    def _calibrate_sigma_from_dp(self) -> None:
+        """Optionally set self.sigma using DP budget (epsilon, delta).
+
+        Uses single-sigma calibration based on RDP composition across layers/rounds
+        with a conservative aggregate over secret scalings: S_alpha <= m / alpha_min^2.
+        Requires dp_epsilon, dp_delta, and dp_sensitivity_total_l2.
+        """
+        if self.dp_epsilon is None or self.dp_delta is None or self.dp_sens_tot_l2 is None:
+            return
+
+        # If sigma already set (>0), do not override
+        if self.sigma and self.sigma > 0:
+            logger.info(
+                f"PUM DP-calibration skipped: sigma={self.sigma} already provided."
+            )
+            return
+
+        eps_tgt = float(self.dp_epsilon)
+        delta = float(self.dp_delta)
+        R = max(int(self.rounds_R), 1)
+        m = max(int(self.copies_m), 1)
+        # Conservative S_alpha upper bound
+        S_alpha = m / (max(self.alpha_min, 1.0) ** 2)
+
+        # Orders grid for RDP optimization
+        if not self.dp_rdp_orders:
+            orders = [
+                1.1, 1.25, 1.5, 2, 3, 4, 5, 8, 10, 16, 32, 64, 128, 256, 512
+            ]
+        else:
+            orders = [float(x) for x in self.dp_rdp_orders if float(x) > 1.0]
+            if not orders:
+                orders = [2.0, 4.0, 8.0, 16.0]
+
+        Delta2_tot = float(self.dp_sens_tot_l2)
+        best_sigma = None
+        best_alpha = None
+
+        for lam in orders:
+            # Feasibility check
+            denom_eps = eps_tgt - (math.log(1.0 / delta) / (lam - 1.0))
+            if denom_eps <= 0:
+                continue
+            # From single-sigma formula: sigma >= Delta2_tot * sqrt((R * lam * S_alpha) / (2 * denom_eps))
+            sig = Delta2_tot * math.sqrt((R * lam * S_alpha) / (2.0 * denom_eps))
+            if sig <= 0 or math.isnan(sig) or math.isinf(sig):
+                continue
+            if (best_sigma is None) or (sig < best_sigma):
+                best_sigma = sig
+                best_alpha = lam
+
+        if best_sigma is None:
+            logger.warning(
+                "PUM DP-calibration failed to find feasible sigma; keep existing sigma=%s",
+                self.sigma,
+            )
+            return
+
+        self.sigma = float(best_sigma)
+        logger.info(
+            f"PUM DP-calibration: epsilon={eps_tgt}, delta={delta}, R={R}, m={m}, "
+            f"alpha_min={self.alpha_min} -> S_alpha<={S_alpha:.4f}, Delta2_tot={Delta2_tot} -> "
+            f"sigma={self.sigma:.6g} (RDP order={best_alpha})"
+        )
 
     # ----------------------------
     # Step budget alignment
@@ -447,6 +534,9 @@ class PUM(FinetuneTrainer):
 
         # Optionally set local_max_steps to match original total steps budget
         self._maybe_set_auto_local_max_steps()
+
+        # Optionally set sigma from DP budget
+        self._calibrate_sigma_from_dp()
 
         for r in range(1, self.rounds_R + 1):
             # Draw zero-sum base noises

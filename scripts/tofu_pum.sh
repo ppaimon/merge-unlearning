@@ -41,6 +41,12 @@ PUM_LOCAL_MAX_STEPS=${PUM_LOCAL_MAX_STEPS:-null}
 PUM_CLIP_UPDATE_NORM=${PUM_CLIP_UPDATE_NORM:-null}
 PUM_USE_REPARAM=${PUM_USE_REPARAM:-false}
 
+# DP knobs for auto sigma (optional)
+DP_EPSILON=${DP_EPSILON:-null}
+DP_DELTA=${DP_DELTA:-null}
+DP_SENS_TOTAL_L2=${DP_SENS_TOTAL_L2:-null}
+DP_RDP_ORDERS=${DP_RDP_ORDERS:-null}
+
 ##########################################
 # 2) RERUN 开关：True=完全重跑（删除输出目录）
 ##########################################
@@ -197,6 +203,11 @@ for split in "${SPLITS[@]}"; do
           trainer.method_args.copies_m="${PUM_COPIES_M}" \
           trainer.method_args.rounds_R="${PUM_ROUNDS_R}" \
           trainer.method_args.sigma="${PUM_SIGMA}" \
+          trainer.method_args.dp_epsilon="${DP_EPSILON}" \
+          trainer.method_args.dp_delta="${DP_DELTA}" \
+          trainer.method_args.dp_sensitivity_total_l2="${DP_SENS_TOTAL_L2}" \
+          trainer.method_args.dp_rdp_orders="${DP_RDP_ORDERS}" \
+          trainer.method_args.dp_use_worstcase_alpha=true \
           trainer.method_args.alpha_min="${PUM_ALPHA_MIN}" \
           trainer.method_args.alpha_max="${PUM_ALPHA_MAX}" \
           trainer.method_args.eta_srv="${PUM_ETA_SRV}" \
@@ -301,6 +312,11 @@ PY
           trainer.method_args.copies_m="${PUM_COPIES_M}" \
           trainer.method_args.rounds_R="${PUM_ROUNDS_R}" \
           trainer.method_args.sigma="${PUM_SIGMA}" \
+          trainer.method_args.dp_epsilon="${DP_EPSILON}" \
+          trainer.method_args.dp_delta="${DP_DELTA}" \
+          trainer.method_args.dp_sensitivity_total_l2="${DP_SENS_TOTAL_L2}" \
+          trainer.method_args.dp_rdp_orders="${DP_RDP_ORDERS}" \
+          trainer.method_args.dp_use_worstcase_alpha=true \
           trainer.method_args.alpha_min="${PUM_ALPHA_MIN}" \
           trainer.method_args.alpha_max="${PUM_ALPHA_MAX}" \
           trainer.method_args.eta_srv="${PUM_ETA_SRV}" \

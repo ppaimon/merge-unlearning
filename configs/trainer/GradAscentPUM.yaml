@@ -9,6 +9,13 @@ method_args:
   copies_m: 4          # number of perturbed copies per round (m)
   rounds_R: 1          # number of PUM rounds (R)
   sigma: 0.0           # Gaussian noise std (per-parameter); 0.0 disables perturbation
+  # DP-based auto-calibration (single-sigma). If dp_epsilon, dp_delta, and dp_sensitivity_total_l2 are set
+  # and sigma==0, the trainer will compute sigma to satisfy (epsilon,delta)-DP.
+  dp_epsilon: null
+  dp_delta: null
+  dp_sensitivity_total_l2: null
+  dp_rdp_orders: [1.1, 2, 4, 8, 16, 32, 64]
+  dp_use_worstcase_alpha: true
   alpha_min: 1.0       # lower bound for secret scaling
   alpha_max: 1.0       # upper bound for secret scaling
   eta_srv: 1.0         # server update scale for aggregated delta
