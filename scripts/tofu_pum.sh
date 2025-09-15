@@ -46,6 +46,10 @@ PUM_SIGMA_PER_LAYER=${PUM_SIGMA_PER_LAYER:-null}  # per-layer σ list if DP not 
 PUM_SERVER_CENTER_CLIP=${PUM_SERVER_CENTER_CLIP:-null}          # null:auto (enable if DP sensitivities/C provided); true/false
 PUM_CENTER_CLIP_C_GLOBAL=${PUM_CENTER_CLIP_C_GLOBAL:-null}      # optional global C for non-layer params (Δ̄_2=2C)
 PUM_CENTER_CLIP_C_PER_LAYER=${PUM_CENTER_CLIP_C_PER_LAYER:-null}# optional per-layer C list (Δ̄_{2,ℓ}=2C_ℓ)
+PUM_CENTER_CLIP_Q=${PUM_CENTER_CLIP_Q:-0.95}                    # quantile q for C_ℓ (0.90–0.99)
+PUM_CENTER_CLIP_KAPPA=${PUM_CENTER_CLIP_KAPPA:-1.25}            # scaling κ for C_ℓ (1.1–1.5)
+PUM_CENTER_CLIP_GAMMA=${PUM_CENTER_CLIP_GAMMA:-1.3}             # round scaling γ for multi-round
+PUM_CENTER_CLIP_REF_MODELS=${PUM_CENTER_CLIP_REF_MODELS:-null}  # optional list of ref model paths (e.g., "[/path/a,/path/b]")
 
 ##########################################
 # 0) 在仓库根目录执行（脚本位于 scripts/ 下）
@@ -245,6 +249,10 @@ for split in "${SPLITS[@]}"; do
           trainer.method_args.server_center_clipping="${PUM_SERVER_CENTER_CLIP}" \
           trainer.method_args.center_clip_C_global="${PUM_CENTER_CLIP_C_GLOBAL}" \
           trainer.method_args.center_clip_C_per_layer="${PUM_CENTER_CLIP_C_PER_LAYER}" \
+          trainer.method_args.center_clip_quantile_q="${PUM_CENTER_CLIP_Q}" \
+          trainer.method_args.center_clip_quantile_kappa="${PUM_CENTER_CLIP_KAPPA}" \
+          trainer.method_args.center_clip_round_gamma="${PUM_CENTER_CLIP_GAMMA}" \
+          trainer.method_args.center_clip_ref_model_paths="${PUM_CENTER_CLIP_REF_MODELS}" \
           trainer.method_args.jitter_tau="${PUM_JITTER_TAU}" \
           trainer.method_args.local_epochs="${PUM_LOCAL_EPOCHS}" \
           trainer.method_args.local_max_steps="${PUM_LOCAL_MAX_STEPS}" \
@@ -364,6 +372,10 @@ PY
           trainer.method_args.server_center_clipping="${PUM_SERVER_CENTER_CLIP}" \
           trainer.method_args.center_clip_C_global="${PUM_CENTER_CLIP_C_GLOBAL}" \
           trainer.method_args.center_clip_C_per_layer="${PUM_CENTER_CLIP_C_PER_LAYER}" \
+          trainer.method_args.center_clip_quantile_q="${PUM_CENTER_CLIP_Q}" \
+          trainer.method_args.center_clip_quantile_kappa="${PUM_CENTER_CLIP_KAPPA}" \
+          trainer.method_args.center_clip_round_gamma="${PUM_CENTER_CLIP_GAMMA}" \
+          trainer.method_args.center_clip_ref_model_paths="${PUM_CENTER_CLIP_REF_MODELS}" \
           trainer.method_args.jitter_tau="${PUM_JITTER_TAU}" \
           trainer.method_args.local_epochs="${PUM_LOCAL_EPOCHS}" \
           trainer.method_args.local_max_steps="${PUM_LOCAL_MAX_STEPS}" \

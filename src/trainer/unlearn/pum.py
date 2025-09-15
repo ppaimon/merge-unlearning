@@ -148,6 +148,11 @@ class PUM(FinetuneTrainer):
         server_center_clipping: Optional[bool] = None,
         center_clip_C_global: Optional[float] = None,
         center_clip_C_per_layer: Optional[List[float]] = None,
+        # Public-only quantile-based center clipping
+        center_clip_quantile_q: float = 0.95,
+        center_clip_quantile_kappa: float = 1.25,
+        center_clip_round_gamma: float = 1.3,
+        center_clip_ref_model_paths: Optional[List[str]] = None,
         jitter_tau: float = 0.0,
         local_epochs: int = 1,
         local_max_steps: Optional[int] = None,
@@ -198,6 +203,12 @@ class PUM(FinetuneTrainer):
         self.center_clip_C_per_layer = (
             list(center_clip_C_per_layer) if center_clip_C_per_layer is not None else None
         )
+        self.center_clip_quantile_q = float(center_clip_quantile_q)
+        self.center_clip_quantile_kappa = float(center_clip_quantile_kappa)
+        self.center_clip_round_gamma = float(center_clip_round_gamma)
+        self.center_clip_ref_model_paths = (
+            list(center_clip_ref_model_paths) if center_clip_ref_model_paths is not None else None
+        )
         self.jitter_tau = float(jitter_tau)
         self.local_epochs = int(local_epochs)
         self.local_max_steps = (
@@ -247,13 +258,18 @@ class PUM(FinetuneTrainer):
                 or (self.dp_sens_tot_l2 is not None and self.dp_sens_tot_l2 > 0)
                 or (self.center_clip_C_per_layer is not None and len(self.center_clip_C_per_layer) > 0)
                 or (self.center_clip_C_global is not None and self.center_clip_C_global > 0)
+                or (self.center_clip_ref_model_paths is not None and len(self.center_clip_ref_model_paths) > 0)
             )
         else:
             self.server_center_clipping = bool(server_center_clipping)
 
         # Initialize EMA reference and previous published mean (server coords)
         self._theta_ref_sd: Dict[str, torch.Tensor] = _state_dict_tensors(self.model)
+        # Preserve pristine base params for public-only quantile computation
+        self._theta_base_sd: Dict[str, torch.Tensor] = {k: v.clone().detach().cpu() for k, v in self._theta_ref_sd.items()}
         self._pub_mean_prev_sd: Optional[Dict[str, torch.Tensor]] = None
+        # Cache for quantile-based per-layer C_l, computed once if refs provided
+        self._center_clip_C_from_quantile: Optional[List[float]] = None
 
     # ----------------------------
     # DP calibration for sigma
@@ -288,6 +304,12 @@ class PUM(FinetuneTrainer):
         """
         if L is None or L <= 0:
             return None
+        # 0) If we computed C_l by public-only quantiles, use Δ̄_{2,ℓ} = 2 C_ℓ
+        if self._center_clip_C_from_quantile is not None and len(self._center_clip_C_from_quantile) > 0:
+            vals = [2.0 * float(c) for c in self._center_clip_C_from_quantile[:L]]
+            if len(vals) < L:
+                vals = vals + [float(vals[-1])] * (L - len(vals))
+            return vals
         # 1) Explicit sensitivities
         if self.dp_sens_per_layer_l2 is not None and len(self.dp_sens_per_layer_l2) > 0:
             vals = [float(x) for x in self.dp_sens_per_layer_l2[:L]]
@@ -465,6 +487,12 @@ class PUM(FinetuneTrainer):
         L = int(self._num_layers) if self._num_layers is not None else None
         C_per_layer: Optional[List[float]] = None
         C_global: Optional[float] = None
+        # 0) Prefer quantile-based thresholds if computed
+        if self._center_clip_C_from_quantile is not None:
+            # Apply round gamma scaling if multi-round
+            gamma = self.center_clip_round_gamma if (self.rounds_R and self.rounds_R > 1) else 1.0
+            C_per_layer = [gamma * float(c) for c in self._center_clip_C_from_quantile]
+            return C_per_layer, None
         if self.center_clip_C_per_layer is not None and len(self.center_clip_C_per_layer) > 0:
             C_per_layer = [float(x) for x in self.center_clip_C_per_layer]
         elif self.dp_sens_per_layer_l2 is not None and len(self.dp_sens_per_layer_l2) > 0:
@@ -480,6 +508,96 @@ class PUM(FinetuneTrainer):
             C_global = 0.5 * float(self.dp_sens_tot_l2)
 
         return C_per_layer, C_global
+
+    # Public-only quantile computation of C_l
+    def _maybe_init_center_C_from_quantile(self) -> None:
+        if self._center_clip_C_from_quantile is not None:
+            return
+        paths = self.center_clip_ref_model_paths
+        if not paths or len(paths) == 0:
+            return
+        if not self._num_layers or self._num_layers <= 0:
+            logger.warning("PUM: cannot compute quantile C_l; model layers unknown")
+            return
+
+        L = int(self._num_layers)
+        # Accumulate per-layer norms across J refs
+        norms_per_layer: List[List[float]] = [[] for _ in range(L)]
+
+        # Helper to compute per-layer norms between sd and base
+        def accumulate_from_state_dict(sd: Dict[str, torch.Tensor]):
+            for name, base_v in self._theta_base_sd.items():
+                li = self._param_layer_index(name)
+                if li is None or li >= L:
+                    continue
+                ref_v = sd.get(name, None)
+                if ref_v is None:
+                    continue
+                dv = (ref_v.detach().cpu() - base_v).float().view(-1)
+                norms_per_layer[li].append(float(torch.linalg.norm(dv, ord=2).item()))
+
+        # Try loading via from_pretrained; fallback to pytorch_model.bin
+        for pth in paths:
+            try:
+                # Prefer HF from_pretrained if available on the model class
+                ref_model = None
+                if hasattr(type(self.model), "from_pretrained"):
+                    try:
+                        ref_model = type(self.model).from_pretrained(pth, torch_dtype=self.model.dtype)
+                    except Exception:
+                        ref_model = None
+                if ref_model is not None:
+                    ref_sd = {k: v.detach().cpu() for (k, v) in ref_model.named_parameters()}
+                    accumulate_from_state_dict(ref_sd)
+                    del ref_model
+                    torch.cuda.empty_cache()
+                    continue
+                # Fallback: attempt to load common filename
+                candidate_files = [
+                    "pytorch_model.bin",
+                    "adapter_model.bin",
+                    "consolidated.00.pth",
+                    "model.safetensors",
+                ]
+                loaded = False
+                import os as _os
+                for fn in candidate_files:
+                    fp = _os.path.join(pth, fn)
+                    if _os.path.exists(fp):
+                        try:
+                            if fp.endswith(".safetensors"):
+                                from safetensors.torch import load_file as _load_sft
+                                sd = _load_sft(fp, device="cpu")
+                            else:
+                                sd = torch.load(fp, map_location="cpu")
+                            # If state dict nested
+                            if isinstance(sd, dict) and "state_dict" in sd and isinstance(sd["state_dict"], dict):
+                                sd = sd["state_dict"]
+                            # Normalize to parameter keys
+                            ref_sd = {k: v for k, v in sd.items() if isinstance(v, torch.Tensor)}
+                            accumulate_from_state_dict(ref_sd)
+                            loaded = True
+                            break
+                        except Exception:
+                            continue
+                if not loaded:
+                    logger.warning("PUM: could not load reference model at %s for quantile C_l", pth)
+            except Exception as e:
+                logger.warning("PUM: error loading reference '%s' for quantile C_l: %s", str(pth), str(e))
+
+        # Compute quantiles per layer
+        q = min(max(self.center_clip_quantile_q, 0.0), 1.0)
+        kappa = max(self.center_clip_quantile_kappa, 0.0)
+        Cs: List[float] = []
+        for li in range(L):
+            vals = norms_per_layer[li]
+            if not vals:
+                Cs.append(0.0)
+            else:
+                t = torch.tensor(vals, dtype=torch.float32)
+                c_l = float(torch.quantile(t, q).item()) * kappa
+                Cs.append(c_l)
+        self._center_clip_C_from_quantile = Cs
 
     def _compute_center_clip_delta(
         self,
@@ -883,6 +1001,10 @@ class PUM(FinetuneTrainer):
 
         # Optionally set sigma/sigma_per_layer from DP budget (DP takes precedence over manual if provided)
         self._calibrate_sigma_from_dp()
+
+        # If requested and references provided, compute quantile-based C_l once
+        if self.server_center_clipping:
+            self._maybe_init_center_C_from_quantile()
 
         for r in range(1, self.rounds_R + 1):
             # Update clipping reference via EMA of last round's published mean (server coords)
