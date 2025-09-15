@@ -78,14 +78,18 @@ def _diff_state_dict(a: Dict[str, torch.Tensor], b: Dict[str, torch.Tensor]) -> 
 
 
 def _generate_zero_sum_noises(
-    model: nn.Module, m: int, sigma: float, device: Optional[torch.device] = None
+    model: nn.Module,
+    m: int,
+    sigma: float,
+    device: Optional[torch.device] = None,
+    per_param_sigma: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, torch.Tensor]]:
     """Generate m zero-sum, equal-variance Gaussian noises per-parameter.
 
     Returns a list of length m where each element is a param-name->tensor map.
     If m == 1 or sigma == 0, returns zeros.
     """
-    if m <= 1 or sigma <= 0:
+    if m <= 1 or (sigma <= 0 and not per_param_sigma):
         return [_zero_like_param_dict(model, device=device) for _ in range(m)]
 
     # For each parameter, construct z_k, subtract mean, scale by sqrt(m/(m-1))
@@ -93,7 +97,14 @@ def _generate_zero_sum_noises(
     noises = [{n: None for n in param_names} for _ in range(m)]
 
     for n, p in _named_params(model):
-        zs = [torch.randn_like(p, device=device or p.device) * sigma for _ in range(m)]
+        # Resolve std for this parameter: prefer per_param_sigma, else global sigma
+        sig_n = float(per_param_sigma.get(n, sigma)) if per_param_sigma else float(sigma)
+        if sig_n <= 0:
+            # No noise for this param; keep zeros
+            for k in range(m):
+                noises[k][n] = torch.zeros_like(p, device=device or p.device)
+            continue
+        zs = [torch.randn_like(p, device=device or p.device) * sig_n for _ in range(m)]
         z_mean = torch.stack(zs, dim=0).mean(dim=0)
         scale = math.sqrt(m / (m - 1))
         for k in range(m):
@@ -118,19 +129,31 @@ class PUM(FinetuneTrainer):
         copies_m: int = 4,
         rounds_R: int = 1,
         sigma: float = 0.0,
+        sigma_per_layer: Optional[List[float]] = None,
+        # Switch: use per-layer noise (DP-calibrated) vs global noise
+        per_layer_noise: bool = False,
         # DP-based noise calibration (single-sigma across layers)
         dp_epsilon: Optional[float] = None,
         dp_delta: Optional[float] = None,
         dp_sensitivity_total_l2: Optional[float] = None,
+        dp_sensitivity_per_layer_l2: Optional[List[float]] = None,
         dp_rdp_orders: Optional[List[float]] = None,
         dp_use_worstcase_alpha: bool = True,
+        dp_per_layer_allocation: str = "auto",  # "auto", "equalized", or "varmin"
         alpha_min: float = 1.0,
         alpha_max: float = 1.0,
         eta_srv: float = 1.0,
+        # DP clipping reference and per-copy jitter
+        theta_ref_beta: float = 0.8,
+        server_center_clipping: Optional[bool] = None,
+        center_clip_C_global: Optional[float] = None,
+        center_clip_C_per_layer: Optional[List[float]] = None,
+        jitter_tau: float = 0.0,
         local_epochs: int = 1,
         local_max_steps: Optional[int] = None,
         auto_balance_local_max_steps: bool = False,
         clip_update_norm: Optional[float] = None,
+        clip_update_norm_per_layer: Optional[List[float]] = None,
         use_orthogonal_reparam: bool = False,  # placeholder (identity by default)
         # base trainer args
         *args,
@@ -143,25 +166,48 @@ class PUM(FinetuneTrainer):
         self.copies_m = int(copies_m)
         self.rounds_R = int(rounds_R)
         self.sigma = float(sigma)
+        self.sigma_per_layer = list(sigma_per_layer) if sigma_per_layer is not None else None
+        self.per_layer_noise = bool(per_layer_noise)
         # DP args
         self.dp_epsilon = float(dp_epsilon) if dp_epsilon is not None else None
         self.dp_delta = float(dp_delta) if dp_delta is not None else None
         self.dp_sens_tot_l2 = (
             float(dp_sensitivity_total_l2) if dp_sensitivity_total_l2 is not None else None
         )
+        self.dp_sens_per_layer_l2 = (
+            list(dp_sensitivity_per_layer_l2) if dp_sensitivity_per_layer_l2 is not None else None
+        )
         self.dp_rdp_orders = (
             list(dp_rdp_orders) if dp_rdp_orders is not None else None
         )
         self.dp_use_worstcase_alpha = bool(dp_use_worstcase_alpha)
+        self.dp_per_layer_allocation = str(dp_per_layer_allocation).lower().strip()
+        if self.dp_per_layer_allocation not in ("auto", "equalized", "varmin"):
+            logger.warning(
+                "PUM: dp_per_layer_allocation '%s' not in {auto,equalized,varmin}; defaulting to 'auto'",
+                self.dp_per_layer_allocation,
+            )
+            self.dp_per_layer_allocation = "auto"
         self.alpha_min = float(alpha_min)
         self.alpha_max = float(alpha_max)
         self.eta_srv = float(eta_srv)
+        self.theta_ref_beta = float(theta_ref_beta)
+        self.center_clip_C_global = (
+            float(center_clip_C_global) if center_clip_C_global is not None else None
+        )
+        self.center_clip_C_per_layer = (
+            list(center_clip_C_per_layer) if center_clip_C_per_layer is not None else None
+        )
+        self.jitter_tau = float(jitter_tau)
         self.local_epochs = int(local_epochs)
         self.local_max_steps = (
             int(local_max_steps) if local_max_steps is not None else None
         )
         self.auto_balance_local_max_steps = bool(auto_balance_local_max_steps)
         self.clip_update_norm = clip_update_norm
+        self.clip_update_norm_per_layer = (
+            list(clip_update_norm_per_layer) if clip_update_norm_per_layer is not None else None
+        )
         self.use_orthogonal_reparam = use_orthogonal_reparam
 
         if self.alpha_min < 1.0:
@@ -175,73 +221,327 @@ class PUM(FinetuneTrainer):
         # Seed per-round/copy deterministically for reproducibility across ranks
         self._base_seed = int(self.args.seed or 0)
 
+        # Introspect model depth for per-layer features
+        try:
+            self._num_layers = int(len(self.model.model.layers))  # type: ignore[attr-defined]
+        except Exception:
+            self._num_layers = None
+
+        if self.sigma_per_layer is not None and self._num_layers is not None:
+            if len(self.sigma_per_layer) != self._num_layers:
+                logger.warning(
+                    "PUM: sigma_per_layer length=%d mismatches model layers=%s; will use overlap and fallback to global sigma for others",
+                    len(self.sigma_per_layer), str(self._num_layers),
+                )
+        if self.clip_update_norm_per_layer is not None and self._num_layers is not None:
+            if len(self.clip_update_norm_per_layer) != self._num_layers:
+                logger.warning(
+                    "PUM: clip_update_norm_per_layer length=%d mismatches model layers=%s; using overlap; others un-clipped or use global clip if set",
+                    len(self.clip_update_norm_per_layer), str(self._num_layers),
+                )
+
+        # Server-side clipping default enablement: on if any sensitivity or explicit C provided
+        if server_center_clipping is None:
+            self.server_center_clipping = (
+                (self.dp_sens_per_layer_l2 is not None and len(self.dp_sens_per_layer_l2) > 0)
+                or (self.dp_sens_tot_l2 is not None and self.dp_sens_tot_l2 > 0)
+                or (self.center_clip_C_per_layer is not None and len(self.center_clip_C_per_layer) > 0)
+                or (self.center_clip_C_global is not None and self.center_clip_C_global > 0)
+            )
+        else:
+            self.server_center_clipping = bool(server_center_clipping)
+
+        # Initialize EMA reference and previous published mean (server coords)
+        self._theta_ref_sd: Dict[str, torch.Tensor] = _state_dict_tensors(self.model)
+        self._pub_mean_prev_sd: Optional[Dict[str, torch.Tensor]] = None
+
     # ----------------------------
     # DP calibration for sigma
     # ----------------------------
-    def _calibrate_sigma_from_dp(self) -> None:
-        """Optionally set self.sigma using DP budget (epsilon, delta).
+    def _resolve_S_alpha(self, m: int) -> float:
+        """Compute S_alpha = sum_k 1/alpha_k^2 used in DP accounting.
 
-        Uses single-sigma calibration based on RDP composition across layers/rounds
-        with a conservative aggregate over secret scalings: S_alpha <= m / alpha_min^2.
-        Requires dp_epsilon, dp_delta, and dp_sensitivity_total_l2.
+        If dp_use_worstcase_alpha is True (default), use the worst-case upper bound m/alpha_min^2.
+        Otherwise, approximate the expected value under a uniform distribution on [alpha_min, alpha_max].
         """
-        if self.dp_epsilon is None or self.dp_delta is None or self.dp_sens_tot_l2 is None:
-            return
+        a_min = max(float(self.alpha_min), 1.0)
+        a_max = max(float(self.alpha_max), a_min)
+        if self.dp_use_worstcase_alpha or a_max <= a_min:
+            return m / (a_min ** 2)
+        # E[1/alpha^2] for alpha ~ Uniform[a_min, a_max]
+        try:
+            exp_inv_sq = (1.0 / a_min - 1.0 / a_max) / (a_max - a_min)
+            return m * exp_inv_sq
+        except ZeroDivisionError:
+            return m / (a_min ** 2)
 
-        # If sigma already set (>0), do not override
-        if self.sigma and self.sigma > 0:
-            logger.info(
-                f"PUM DP-calibration skipped: sigma={self.sigma} already provided."
-            )
+    def _orders_grid(self) -> List[float]:
+        if not self.dp_rdp_orders:
+            return [1.1, 1.25, 1.5, 2, 3, 4, 5, 8, 10, 16, 32, 64, 128, 256, 512]
+        orders = [float(x) for x in self.dp_rdp_orders if float(x) > 1.0]
+        return orders or [2.0, 4.0, 8.0, 16.0]
+
+    def _get_per_layer_sens(self, L: int) -> Optional[List[float]]:
+        """Resolve per-layer L2 sensitivity bounds Δ̄_{2,ℓ} for ℓ=1..L.
+
+        Priority: explicit dp_sensitivity_per_layer_l2 -> clip_update_norm_per_layer -> uniform split of dp_sensitivity_total_l2.
+        """
+        if L is None or L <= 0:
+            return None
+        # 1) Explicit sensitivities
+        if self.dp_sens_per_layer_l2 is not None and len(self.dp_sens_per_layer_l2) > 0:
+            vals = [float(x) for x in self.dp_sens_per_layer_l2[:L]]
+            if len(vals) < L:
+                vals = vals + [float(vals[-1])] * (L - len(vals))
+            return vals
+        # 2) Use per-layer clipping thresholds as sensitivity proxies
+        if self.clip_update_norm_per_layer is not None and len(self.clip_update_norm_per_layer) > 0:
+            vals = [
+                (float(x) if (x is not None and float(x) > 0) else 0.0)
+                for x in self.clip_update_norm_per_layer[:L]
+            ]
+            if len(vals) < L:
+                vals = vals + [0.0] * (L - len(vals))
+            return vals
+        # 3) Uniform split of total sensitivity across L layers if available
+        if self.dp_sens_tot_l2 is not None and self.dp_sens_tot_l2 > 0 and L > 0:
+            # Require that sum_l Δ_l^2 = (Δ_tot)^2 with Δ_l all equal => Δ_l = Δ_tot / sqrt(L)
+            per = float(self.dp_sens_tot_l2) / math.sqrt(float(L))
+            return [per for _ in range(L)]
+        return None
+
+    def _calibrate_sigma_from_dp(self) -> None:
+        """DP-driven calibration for noise.
+
+        - If per_layer_noise=True, compute self.sigma_per_layer via RDP accounting (equalized or variance-minimizing split).
+        - Else compute global self.sigma via single-sigma formula.
+        When DP knobs are present, DP calibration takes precedence over manually provided sigma/sigma_per_layer.
+        """
+        if self.dp_epsilon is None or self.dp_delta is None:
             return
 
         eps_tgt = float(self.dp_epsilon)
         delta = float(self.dp_delta)
         R = max(int(self.rounds_R), 1)
         m = max(int(self.copies_m), 1)
-        # Conservative S_alpha upper bound
-        S_alpha = m / (max(self.alpha_min, 1.0) ** 2)
+        S_alpha = self._resolve_S_alpha(m)
 
-        # Orders grid for RDP optimization
-        if not self.dp_rdp_orders:
-            orders = [
-                1.1, 1.25, 1.5, 2, 3, 4, 5, 8, 10, 16, 32, 64, 128, 256, 512
-            ]
-        else:
-            orders = [float(x) for x in self.dp_rdp_orders if float(x) > 1.0]
-            if not orders:
-                orders = [2.0, 4.0, 8.0, 16.0]
+        orders = self._orders_grid()
+
+        # Per-layer calibration branch
+        if self.per_layer_noise:
+            L = int(self._num_layers) if self._num_layers is not None else None
+            if not L or L <= 0:
+                logger.warning("PUM DP per-layer calibration requested but model layers not found; falling back to single-sigma calibration.")
+            else:
+                Delta_l = self._get_per_layer_sens(L)
+                if Delta_l is None:
+                    logger.warning(
+                        "PUM DP per-layer calibration needs per-layer or total sensitivity; provide dp_sensitivity_per_layer_l2, clip_update_norm_per_layer, or dp_sensitivity_total_l2. Falling back to single-sigma."
+                    )
+                else:
+                    # Optimize over RDP orders; if allocation='auto', compare equalized vs variance-minimizing and pick smaller variance
+                    best_sigmas: Optional[List[float]] = None
+                    best_order: Optional[float] = None
+                    best_total_var: Optional[float] = None
+                    sum_D2 = sum(d * d for d in Delta_l)
+                    sum_D = sum(Delta_l)
+                    for lam in orders:
+                        A = eps_tgt - (math.log(1.0 / delta) / (lam - 1.0))
+                        if A <= 0:
+                            continue
+                        K = (2.0 * A) / (R * lam * max(S_alpha, 1e-12))
+                        if K <= 0:
+                            continue
+                        # equalized: σ_l = κ Δ_l, κ = sqrt(L / K)
+                        kappa = math.sqrt(float(L) / K)
+                        sig_eq = [kappa * d for d in Delta_l]
+                        tot_eq = (kappa * kappa) * sum_D2
+                        # variance-minimizing: σ_l = c sqrt(Δ_l), c = sqrt((sum Δ_l) / K)
+                        c = math.sqrt(max(sum_D, 0.0) / K)
+                        sig_vm = [c * math.sqrt(max(d, 0.0)) for d in Delta_l]
+                        tot_vm = (c * c) * sum_D
+
+                        candidates = []
+                        if self.dp_per_layer_allocation in ("auto", "equalized"):
+                            candidates.append((tot_eq, sig_eq))
+                        if self.dp_per_layer_allocation in ("auto", "varmin"):
+                            candidates.append((tot_vm, sig_vm))
+
+                        for total_var, sigmas in candidates:
+                            if not all(math.isfinite(s) and s >= 0 for s in sigmas):
+                                continue
+                            if (best_total_var is None) or (total_var < best_total_var):
+                                best_total_var = total_var
+                                best_sigmas = sigmas
+                                best_order = lam
+
+                    if best_sigmas is not None:
+                        self.sigma_per_layer = [float(s) for s in best_sigmas]
+                        # Ensure we do not add noise to non-layer params in per-layer mode
+                        self.sigma = 0.0
+                        logger.info(
+                            "PUM DP per-layer calibration: eps=%.5g, delta=%g, R=%d, m=%d, S_alpha=%.6g, alloc=%s -> order=%.3g",
+                            eps_tgt, delta, R, m, S_alpha, self.dp_per_layer_allocation, best_order or float('nan')
+                        )
+                        return
+
+        # Fallback or global calibration branch
+        # Require total sensitivity for single-sigma calibration
+        if self.dp_sens_tot_l2 is None:
+            return
 
         Delta2_tot = float(self.dp_sens_tot_l2)
         best_sigma = None
-        best_alpha = None
+        best_order = None
 
         for lam in orders:
-            # Feasibility check
-            denom_eps = eps_tgt - (math.log(1.0 / delta) / (lam - 1.0))
-            if denom_eps <= 0:
+            A = eps_tgt - (math.log(1.0 / delta) / (lam - 1.0))
+            if A <= 0:
                 continue
-            # From single-sigma formula: sigma >= Delta2_tot * sqrt((R * lam * S_alpha) / (2 * denom_eps))
-            sig = Delta2_tot * math.sqrt((R * lam * S_alpha) / (2.0 * denom_eps))
+            sig = Delta2_tot * math.sqrt((R * lam * max(S_alpha, 1e-12)) / (2.0 * A))
             if sig <= 0 or math.isnan(sig) or math.isinf(sig):
                 continue
             if (best_sigma is None) or (sig < best_sigma):
                 best_sigma = sig
-                best_alpha = lam
+                best_order = lam
 
         if best_sigma is None:
             logger.warning(
-                "PUM DP-calibration failed to find feasible sigma; keep existing sigma=%s",
-                self.sigma,
+                "PUM DP-calibration failed to find feasible sigma; keep existing sigma(s) (sigma=%s, per-layer=%s)",
+                str(self.sigma), str(self.sigma_per_layer is not None),
             )
             return
 
+        # Set global sigma and clear per-layer unless the user explicitly provided per-layer without DP
         self.sigma = float(best_sigma)
+        if self.per_layer_noise:
+            # If per-layer requested but we fell back to global, clear any prior per-layer overrides
+            self.sigma_per_layer = None
         logger.info(
-            f"PUM DP-calibration: epsilon={eps_tgt}, delta={delta}, R={R}, m={m}, "
-            f"alpha_min={self.alpha_min} -> S_alpha<={S_alpha:.4f}, Delta2_tot={Delta2_tot} -> "
-            f"sigma={self.sigma:.6g} (RDP order={best_alpha})"
+            "PUM DP single-sigma: eps=%.5g, delta=%g, R=%d, m=%d, S_alpha=%.6g, Delta2_tot=%.6g -> sigma=%.6g (order=%.3g)",
+            eps_tgt, delta, R, m, S_alpha, Delta2_tot, self.sigma, best_order or float('nan')
         )
+
+    # ----------------------------
+    # Name parsing helpers
+    # ----------------------------
+    @staticmethod
+    def _param_layer_index(param_name: str) -> Optional[int]:
+        """Extract layer index from a parameter name like 'model.layers.12.attn.q_proj.weight'."""
+        # Fast path: expect prefix 'model.layers.'
+        prefix = "model.layers."
+        if not param_name.startswith(prefix):
+            return None
+        rest = param_name[len(prefix):]
+        # rest begins with '<int>.'
+        try:
+            dot = rest.find(".")
+            if dot <= 0:
+                return None
+            idx = int(rest[:dot])
+            return idx
+        except Exception:
+            return None
+
+    def _build_per_param_sigma(self) -> Optional[Dict[str, float]]:
+        if self.sigma_per_layer is None:
+            return None
+        # Default for non-layer params: use global sigma if >0, else 0.0
+        sigma_other = 0.0 if self.per_layer_noise else (self.sigma if (self.sigma and self.sigma > 0) else 0.0)
+        per_param: Dict[str, float] = {}
+        for n, _ in _named_params(self.model):
+            li = self._param_layer_index(n)
+            if li is not None and li < len(self.sigma_per_layer):
+                per_param[n] = float(self.sigma_per_layer[li])
+            else:
+                per_param[n] = float(sigma_other)
+        return per_param
+
+    # ----------------------------
+    # Server-side DP clipping reference and delta
+    # ----------------------------
+    def _resolve_center_clip_thresholds(self) -> Tuple[Optional[List[float]], Optional[float]]:
+        L = int(self._num_layers) if self._num_layers is not None else None
+        C_per_layer: Optional[List[float]] = None
+        C_global: Optional[float] = None
+        if self.center_clip_C_per_layer is not None and len(self.center_clip_C_per_layer) > 0:
+            C_per_layer = [float(x) for x in self.center_clip_C_per_layer]
+        elif self.dp_sens_per_layer_l2 is not None and len(self.dp_sens_per_layer_l2) > 0:
+            C_per_layer = [0.5 * float(x) for x in self.dp_sens_per_layer_l2]
+        elif self.dp_sens_tot_l2 is not None and L and L > 0:
+            C_tot = 0.5 * float(self.dp_sens_tot_l2)
+            per = C_tot / math.sqrt(float(L))
+            C_per_layer = [per for _ in range(L)]
+
+        if self.center_clip_C_global is not None:
+            C_global = float(self.center_clip_C_global)
+        elif self.dp_sens_tot_l2 is not None and (not C_per_layer):
+            C_global = 0.5 * float(self.dp_sens_tot_l2)
+
+        return C_per_layer, C_global
+
+    def _compute_center_clip_delta(
+        self,
+        current_sd: Dict[str, torch.Tensor],
+        ref_sd: Dict[str, torch.Tensor],
+        C_per_layer: Optional[List[float]],
+        C_global: Optional[float],
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        if not C_per_layer and not C_global:
+            return None
+
+        L = int(self._num_layers) if self._num_layers is not None else 0
+        layer_sq = [0.0 for _ in range(max(L, 0))]
+        other_sq = 0.0
+        q_cache: Dict[str, torch.Tensor] = {}
+        for name, cur in current_sd.items():
+            ref = ref_sd.get(name, cur)
+            q = (cur - ref)
+            q_cache[name] = q
+            li = self._param_layer_index(name)
+            if C_per_layer is not None and li is not None and li < len(C_per_layer):
+                layer_sq[li] += q.detach().float().pow(2).sum().item()
+            else:
+                other_sq += q.detach().float().pow(2).sum().item()
+
+        scales_layer: List[float] = []
+        if C_per_layer is not None and len(C_per_layer) > 0:
+            for li in range(len(C_per_layer)):
+                C = float(C_per_layer[li]) if C_per_layer[li] is not None else 0.0
+                if C <= 0:
+                    scales_layer.append(0.0)
+                else:
+                    nrm = math.sqrt(max(layer_sq[li], 1e-12))
+                    scales_layer.append(min(1.0, C / nrm))
+        s_other = None
+        if C_global is not None and C_global > 0:
+            nrm = math.sqrt(max(other_sq, 1e-12))
+            s_other = min(1.0, C_global / nrm)
+
+        delta: Dict[str, torch.Tensor] = {}
+        for name, q in q_cache.items():
+            li = self._param_layer_index(name)
+            if C_per_layer is not None and li is not None and li < len(scales_layer):
+                s = scales_layer[li]
+                if s == 0.0:
+                    delta[name] = -q
+                elif s == 1.0:
+                    delta[name] = torch.zeros_like(q)
+                else:
+                    delta[name] = (s - 1.0) * q
+            elif s_other is not None:
+                s = s_other
+                if s == 0.0:
+                    delta[name] = -q
+                elif s == 1.0:
+                    delta[name] = torch.zeros_like(q)
+                else:
+                    delta[name] = (s - 1.0) * q
+            else:
+                delta[name] = torch.zeros_like(q)
+
+        return delta
 
     # ----------------------------
     # Step budget alignment
@@ -514,17 +814,63 @@ class PUM(FinetuneTrainer):
         )
 
     def _clip_update(self, update: Dict[str, torch.Tensor]):
-        if self.clip_update_norm is None:
-            return update
-        # Compute global L2 norm, then scale if above threshold
-        total = 0.0
-        for v in update.values():
-            total += v.detach().float().pow(2).sum().item()
-        norm = math.sqrt(max(total, 1e-12))
-        if norm <= self.clip_update_norm:
-            return update
-        scale = self.clip_update_norm / (norm + 1e-12)
-        return {k: v * scale for k, v in update.items()}
+        # Prefer per-layer clipping if provided
+        if self.clip_update_norm_per_layer is not None and self._num_layers:
+            L = min(int(self._num_layers), len(self.clip_update_norm_per_layer))
+            # First pass: compute per-layer squared norms
+            layer_sq = [0.0 for _ in range(L)]
+            for name, v in update.items():
+                li = self._param_layer_index(name)
+                if li is None or li >= L:
+                    continue
+                layer_sq[li] += v.detach().float().pow(2).sum().item()
+            # Compute scales per layer
+            scales = [1.0 for _ in range(L)]
+            for li in range(L):
+                thr = float(self.clip_update_norm_per_layer[li])
+                if thr is None or thr <= 0:
+                    continue
+                norm = math.sqrt(max(layer_sq[li], 1e-12))
+                if norm > thr:
+                    scales[li] = thr / (norm + 1e-12)
+            # Apply scaling per layer
+            out: Dict[str, torch.Tensor] = {}
+            for name, v in update.items():
+                li = self._param_layer_index(name)
+                if li is not None and li < L:
+                    s = scales[li]
+                    if s != 1.0:
+                        out[name] = v * s
+                    else:
+                        out[name] = v
+                else:
+                    out[name] = v
+            # Optionally apply global clip to 'other' params if requested
+            if self.clip_update_norm is not None:
+                # Compute norm over 'other' params and scale them uniformly
+                other_sq = 0.0
+                for name, v in update.items():
+                    if self._param_layer_index(name) is None or (self._param_layer_index(name) >= L):
+                        other_sq += v.detach().float().pow(2).sum().item()
+                other_norm = math.sqrt(max(other_sq, 1e-12))
+                if other_norm > self.clip_update_norm:
+                    s = self.clip_update_norm / (other_norm + 1e-12)
+                    for name, v in update.items():
+                        if self._param_layer_index(name) is None or (self._param_layer_index(name) >= L):
+                            out[name] = v * s
+            return out
+
+        # Fallback: global L2 clipping
+        if self.clip_update_norm is not None and self.clip_update_norm > 0:
+            total = 0.0
+            for v in update.values():
+                total += v.detach().float().pow(2).sum().item()
+            norm = math.sqrt(max(total, 1e-12))
+            if norm <= self.clip_update_norm:
+                return update
+            scale = self.clip_update_norm / (norm + 1e-12)
+            return {k: v * scale for k, v in update.items()}
+        return update
 
     # ----------------------------
     # Main train loop
@@ -535,12 +881,27 @@ class PUM(FinetuneTrainer):
         # Optionally set local_max_steps to match original total steps budget
         self._maybe_set_auto_local_max_steps()
 
-        # Optionally set sigma from DP budget
+        # Optionally set sigma/sigma_per_layer from DP budget (DP takes precedence over manual if provided)
         self._calibrate_sigma_from_dp()
 
         for r in range(1, self.rounds_R + 1):
+            # Update clipping reference via EMA of last round's published mean (server coords)
+            if self._pub_mean_prev_sd is not None:
+                beta = float(self.theta_ref_beta)
+                with torch.no_grad():
+                    for n, _ in _named_params(self.model):
+                        prev_ref = self._theta_ref_sd.get(n)
+                        pub = self._pub_mean_prev_sd.get(n, prev_ref)
+                        if prev_ref is None:
+                            self._theta_ref_sd[n] = pub.detach().clone()
+                        else:
+                            self._theta_ref_sd[n] = (1.0 - beta) * prev_ref + beta * pub
+
             # Draw zero-sum base noises
-            base_noises = _generate_zero_sum_noises(self.model, self.copies_m, self.sigma)
+            per_param_sigma = self._build_per_param_sigma()
+            base_noises = _generate_zero_sum_noises(
+                self.model, self.copies_m, self.sigma, per_param_sigma=per_param_sigma
+            )
             # Sample secret alphas
             alphas: List[float] = []
             g = torch.Generator(device="cpu")
@@ -555,25 +916,58 @@ class PUM(FinetuneTrainer):
             # Streaming stats
             S0 = 0.0
             S1 = _zero_like_param_dict(self.model)
+            # Per-round publication mean accumulator in server coordinates
+            pub_sum_server = _zero_like_param_dict(self.model)
+            # Server-side center clipping delta (relative to current params)
+            cur_sd = _state_dict_tensors(self.model)
+            center_delta = None
+            if self.server_center_clipping:
+                C_per_layer, C_global = self._resolve_center_clip_thresholds()
+                center_delta = self._compute_center_clip_delta(cur_sd, self._theta_ref_sd, C_per_layer, C_global)
 
             for k in range(self.copies_m):
                 alpha_k = float(alphas[k])
                 # Perturbation for this copy
                 eps_k = {n: alpha_k * base_noises[k][n] for (n, _) in _named_params(self.model)}
+                # Tiny independent jitter
+                xi_k = None
+                if self.jitter_tau and self.jitter_tau > 0.0:
+                    xi_k = {}
+                    for n, p in _named_params(self.model):
+                        xi_k[n] = torch.randn_like(p) * float(self.jitter_tau)
 
                 # Create a model copy with perturbation applied
                 model_k = copy.deepcopy(self.model)
                 # If a functional T is desired, sample and apply (identity by default)
-                T_k = self._sample_T(model_k, seed=self._base_seed + 31 * r + 7 * k)
+                T_k = (
+                    self._sample_T(model_k, seed=self._base_seed + 31 * r + 7 * k)
+                    if self.use_orthogonal_reparam
+                    else None
+                )
 
-                # Apply epsilon in-place on model_k
+                # Apply center shift, epsilon, and jitter in-place on model_k
+                if center_delta is not None:
+                    _apply_state_dict_delta(model_k, center_delta, scale=1.0)
                 _apply_state_dict_delta(model_k, eps_k, scale=1.0)
+                if xi_k is not None:
+                    _apply_state_dict_delta(model_k, xi_k, scale=1.0)
 
                 # Apply reparameterization (identity now)
                 self._apply_T(model_k, T_k)
 
                 # Snapshot pre-training params in transformed coordinate
                 before_sd = _state_dict_tensors(model_k)
+
+                # Accumulate server-coordinate publication mean for this round: theta + center_delta + eps + xi
+                with torch.no_grad():
+                    for n, _ in _named_params(self.model):
+                        v = cur_sd[n]
+                        if center_delta is not None:
+                            v = v + center_delta[n].to(v.device)
+                        v = v + eps_k[n].to(v.device)
+                        if xi_k is not None:
+                            v = v + xi_k[n].to(v.device)
+                        pub_sum_server[n].add_(v)
 
                 # Build inner args and inner trainer
                 inner_out_dir = os.path.join(
@@ -613,6 +1007,10 @@ class PUM(FinetuneTrainer):
                 for n, p in _named_params(self.model):
                     update = (S1[n] * inv_S0).to(p.device)
                     p.add_(self.eta_srv * update)
+
+            # Store published mean (server coords) for next-round EMA reference
+            m = float(self.copies_m)
+            self._pub_mean_prev_sd = {n: (pub_sum_server[n] / m).detach().clone() for n in pub_sum_server}
 
         # End of rounds; switch to eval mode for downstream evaluate()
         self.model.eval()

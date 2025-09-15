@@ -2,6 +2,52 @@
 set -euo pipefail
 
 ##########################################
+# Tuning Hyperparameters (centralized block)
+# - Defaults are sensible; ranges are recommended search windows.
+# - Edit here or override via environment variables before running.
+##########################################
+# Training throughput
+BATCH_SIZE_PER_GPU=${BATCH_SIZE_PER_GPU:-2}       # per-device batch size; range: 1–8 (depends on VRAM)
+GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-4}          # gradient accumulation; range: 1–16 (match global batch)
+
+# PUM outer loop
+PUM_COPIES_M=${PUM_COPIES_M:-4}                  # number of perturbed copies per round (m); range: 4–16
+PUM_ROUNDS_R=${PUM_ROUNDS_R:-1}                  # number of PUM rounds (R); range: 1–3
+PUM_ALPHA_MIN=${PUM_ALPHA_MIN:-1.0}              # secret scaling min α_min (≥1); range: 1.0–1.5
+PUM_ALPHA_MAX=${PUM_ALPHA_MAX:-1.0}              # secret scaling max α_max; range: α_min–1.5
+PUM_ETA_SRV=${PUM_ETA_SRV:-1.0}                  # server step size η_srv; range: 0.5–1.5
+PUM_THETA_REF_BETA=${PUM_THETA_REF_BETA:-0.8}    # EMA β for DP clipping reference; range: 0.7–0.9
+PUM_JITTER_TAU=${PUM_JITTER_TAU:-0.0}            # tiny jitter τ per copy (std); range: 0–1e-3 (0 disables)
+PUM_USE_REPARAM=${PUM_USE_REPARAM:-false}        # per-copy orthogonal/permutation reparameterization; recommend true if stable
+
+# Local unlearning budget (per copy)
+PUM_LOCAL_EPOCHS=${PUM_LOCAL_EPOCHS:-1}          # local epochs per copy; range: 1–3
+PUM_LOCAL_MAX_STEPS=${PUM_LOCAL_MAX_STEPS:-null} # optional steps cap per copy; null for auto-balance
+
+# Optional robustness (server-side clipping of client updates)
+PUM_CLIP_UPDATE_NORM=${PUM_CLIP_UPDATE_NORM:-null}               # global L2 clip on aligned update; e.g., 5.0–20.0
+PUM_CLIP_UPDATE_PER_LAYER=${PUM_CLIP_UPDATE_PER_LAYER:-null}     # per-layer L2 clips; e.g., "[5,5,...]"
+
+# DP calibration and publication
+PUM_PER_LAYER_NOISE=${PUM_PER_LAYER_NOISE:-false} # true: calibrate per-layer σ_ℓ; recommended when using DP
+DP_EPSILON=${DP_EPSILON:-null}                    # target ε; range: 2–8 (dataset/task-dependent)
+DP_DELTA=${DP_DELTA:-null}                        # target δ; e.g., 2.5e-5 for TOFU (1/(10N)); range: 1e-8–1e-5
+DP_RDP_ORDERS=${DP_RDP_ORDERS:-[1.5,2,3,4,8,16,32,64,128]} # RDP orders sweep
+DP_PER_LAYER_ALLOC=${DP_PER_LAYER_ALLOC:-auto}    # noise allocation across layers: auto|min-var, equalized, varmin
+DP_SENS_TOTAL_L2=${DP_SENS_TOTAL_L2:-null}       # total sensitivity Δ̄_2 (≈ 2 C_total); used for single-σ or fallback
+DP_SENS_PER_LAYER_L2=${DP_SENS_PER_LAYER_L2:-null} # per-layer sensitivity list (≈ 2 C_ℓ); preferred for per-layer σ
+DP_USE_WORSTCASE_ALPHA=${DP_USE_WORSTCASE_ALPHA:-true} # DP bound uses worst-case S_α (recommended true)
+
+# Optional manual noise (discouraged; DP overrides when provided)
+PUM_SIGMA=${PUM_SIGMA:-0.0}                       # global σ if DP not set
+PUM_SIGMA_PER_LAYER=${PUM_SIGMA_PER_LAYER:-null}  # per-layer σ list if DP not set; e.g., "[0.02,0.02,...]"
+
+# Server-side DP clipping of publication center (θ~)
+PUM_SERVER_CENTER_CLIP=${PUM_SERVER_CENTER_CLIP:-null}          # null:auto (enable if DP sensitivities/C provided); true/false
+PUM_CENTER_CLIP_C_GLOBAL=${PUM_CENTER_CLIP_C_GLOBAL:-null}      # optional global C for non-layer params (Δ̄_2=2C)
+PUM_CENTER_CLIP_C_PER_LAYER=${PUM_CENTER_CLIP_C_PER_LAYER:-null}# optional per-layer C list (Δ̄_{2,ℓ}=2C_ℓ)
+
+##########################################
 # 0) 在仓库根目录执行（脚本位于 scripts/ 下）
 ##########################################
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,28 +70,8 @@ export CUDA_VISIBLE_DEVICES="${GPUS:-0,1,2,3}"
 ##########################################
 # 8) 训练超参（可按显存/吞吐调节）
 ##########################################
-per_device_train_batch_size=${BATCH_SIZE_PER_GPU:-2}
-gradient_accumulation_steps=${GRAD_ACCUM_STEPS:-4}
-
-##########################################
-# PUM 专用超参（可通过环境变量覆盖）
-##########################################
-PUM_COPIES_M=${PUM_COPIES_M:-4}
-PUM_ROUNDS_R=${PUM_ROUNDS_R:-1}
-PUM_SIGMA=${PUM_SIGMA:-0.0}
-PUM_ALPHA_MIN=${PUM_ALPHA_MIN:-1.0}
-PUM_ALPHA_MAX=${PUM_ALPHA_MAX:-1.0}
-PUM_ETA_SRV=${PUM_ETA_SRV:-1.0}
-PUM_LOCAL_EPOCHS=${PUM_LOCAL_EPOCHS:-1}
-PUM_LOCAL_MAX_STEPS=${PUM_LOCAL_MAX_STEPS:-null}
-PUM_CLIP_UPDATE_NORM=${PUM_CLIP_UPDATE_NORM:-null}
-PUM_USE_REPARAM=${PUM_USE_REPARAM:-false}
-
-# DP knobs for auto sigma (optional)
-DP_EPSILON=${DP_EPSILON:-null}
-DP_DELTA=${DP_DELTA:-null}
-DP_SENS_TOTAL_L2=${DP_SENS_TOTAL_L2:-null}
-DP_RDP_ORDERS=${DP_RDP_ORDERS:-null}
+per_device_train_batch_size=${BATCH_SIZE_PER_GPU}
+gradient_accumulation_steps=${GRAD_ACCUM_STEPS}
 
 ##########################################
 # 2) RERUN 开关：True=完全重跑（删除输出目录）
@@ -203,18 +229,28 @@ for split in "${SPLITS[@]}"; do
           trainer.method_args.copies_m="${PUM_COPIES_M}" \
           trainer.method_args.rounds_R="${PUM_ROUNDS_R}" \
           trainer.method_args.sigma="${PUM_SIGMA}" \
+          trainer.method_args.sigma_per_layer="${PUM_SIGMA_PER_LAYER}" \
+          trainer.method_args.per_layer_noise="${PUM_PER_LAYER_NOISE}" \
           trainer.method_args.dp_epsilon="${DP_EPSILON}" \
           trainer.method_args.dp_delta="${DP_DELTA}" \
           trainer.method_args.dp_sensitivity_total_l2="${DP_SENS_TOTAL_L2}" \
+          trainer.method_args.dp_sensitivity_per_layer_l2="${DP_SENS_PER_LAYER_L2}" \
           trainer.method_args.dp_rdp_orders="${DP_RDP_ORDERS}" \
-          trainer.method_args.dp_use_worstcase_alpha=true \
+          trainer.method_args.dp_use_worstcase_alpha="${DP_USE_WORSTCASE_ALPHA}" \
+          trainer.method_args.dp_per_layer_allocation="${DP_PER_LAYER_ALLOC}" \
           trainer.method_args.alpha_min="${PUM_ALPHA_MIN}" \
           trainer.method_args.alpha_max="${PUM_ALPHA_MAX}" \
           trainer.method_args.eta_srv="${PUM_ETA_SRV}" \
+          trainer.method_args.theta_ref_beta="${PUM_THETA_REF_BETA}" \
+          trainer.method_args.server_center_clipping="${PUM_SERVER_CENTER_CLIP}" \
+          trainer.method_args.center_clip_C_global="${PUM_CENTER_CLIP_C_GLOBAL}" \
+          trainer.method_args.center_clip_C_per_layer="${PUM_CENTER_CLIP_C_PER_LAYER}" \
+          trainer.method_args.jitter_tau="${PUM_JITTER_TAU}" \
           trainer.method_args.local_epochs="${PUM_LOCAL_EPOCHS}" \
           trainer.method_args.local_max_steps="${PUM_LOCAL_MAX_STEPS}" \
           trainer.method_args.auto_balance_local_max_steps=true \
           trainer.method_args.clip_update_norm="${PUM_CLIP_UPDATE_NORM}" \
+          trainer.method_args.clip_update_norm_per_layer="${PUM_CLIP_UPDATE_PER_LAYER}" \
           trainer.method_args.use_orthogonal_reparam="${PUM_USE_REPARAM}"
           # 如你的 DPO 代码需显式指定 idk 路径，可解注下一行
           # data.idk_path="${IDK_PATH}"
@@ -312,18 +348,28 @@ PY
           trainer.method_args.copies_m="${PUM_COPIES_M}" \
           trainer.method_args.rounds_R="${PUM_ROUNDS_R}" \
           trainer.method_args.sigma="${PUM_SIGMA}" \
+          trainer.method_args.sigma_per_layer="${PUM_SIGMA_PER_LAYER}" \
+          trainer.method_args.per_layer_noise="${PUM_PER_LAYER_NOISE}" \
           trainer.method_args.dp_epsilon="${DP_EPSILON}" \
           trainer.method_args.dp_delta="${DP_DELTA}" \
           trainer.method_args.dp_sensitivity_total_l2="${DP_SENS_TOTAL_L2}" \
+          trainer.method_args.dp_sensitivity_per_layer_l2="${DP_SENS_PER_LAYER_L2}" \
           trainer.method_args.dp_rdp_orders="${DP_RDP_ORDERS}" \
-          trainer.method_args.dp_use_worstcase_alpha=true \
+          trainer.method_args.dp_use_worstcase_alpha="${DP_USE_WORSTCASE_ALPHA}" \
+          trainer.method_args.dp_per_layer_allocation="${DP_PER_LAYER_ALLOC}" \
           trainer.method_args.alpha_min="${PUM_ALPHA_MIN}" \
           trainer.method_args.alpha_max="${PUM_ALPHA_MAX}" \
           trainer.method_args.eta_srv="${PUM_ETA_SRV}" \
+          trainer.method_args.theta_ref_beta="${PUM_THETA_REF_BETA}" \
+          trainer.method_args.server_center_clipping="${PUM_SERVER_CENTER_CLIP}" \
+          trainer.method_args.center_clip_C_global="${PUM_CENTER_CLIP_C_GLOBAL}" \
+          trainer.method_args.center_clip_C_per_layer="${PUM_CENTER_CLIP_C_PER_LAYER}" \
+          trainer.method_args.jitter_tau="${PUM_JITTER_TAU}" \
           trainer.method_args.local_epochs="${PUM_LOCAL_EPOCHS}" \
           trainer.method_args.local_max_steps="${PUM_LOCAL_MAX_STEPS}" \
           trainer.method_args.auto_balance_local_max_steps=true \
           trainer.method_args.clip_update_norm="${PUM_CLIP_UPDATE_NORM}" \
+          trainer.method_args.clip_update_norm_per_layer="${PUM_CLIP_UPDATE_PER_LAYER}" \
           trainer.method_args.use_orthogonal_reparam="${PUM_USE_REPARAM}"
 
           python "$EVAL_PY" \

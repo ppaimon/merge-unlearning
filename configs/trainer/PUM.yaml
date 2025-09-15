@@ -8,19 +8,24 @@ method_args:
   inner_method_args: {}       # optional kwargs forwarded to inner handler
   copies_m: 3                 # number of perturbed copies per round (m)
   rounds_R: 1                 # number of PUM rounds (R)
-  sigma: 0.0                  # Gaussian noise std (per-parameter); 0.0 enables DP-based auto-calibration if dp_* provided
-  # DP-based auto-calibration (single-sigma). If dp_epsilon, dp_delta, and dp_sensitivity_total_l2 are set
-  # and sigma==0, the trainer will compute sigma to satisfy (epsilon,delta)-DP under the conservative S_alpha bound.
+  # Noise mode: choose DP-calibrated per-layer vs global
+  per_layer_noise: false      # true => per-layer σ_ℓ via DP; false => single global σ via DP
+  sigma: 0.0                  # Optional manual global std (discouraged; DP overrides when dp_* provided)
+  sigma_per_layer: null       # Optional manual list[L] of per-layer stds (discouraged; DP overrides when dp_* provided)
+  # DP-based auto-calibration. If dp_epsilon, dp_delta are set, trainer computes σ/σ_ℓ from DP using RDP accounting.
   dp_epsilon: null
   dp_delta: null
   dp_sensitivity_total_l2: null
+  dp_sensitivity_per_layer_l2: null   # Optional list[L] Δ̄_{2,ℓ}; else uses clip_update_norm_per_layer or uniform split of total
   dp_rdp_orders: [1.1, 2, 4, 8, 16, 32, 64]
   dp_use_worstcase_alpha: true
+  dp_per_layer_allocation: equalized   # {equalized,varmin}: σ_ℓ ∝ Δ̄_{2,ℓ} or σ_ℓ ∝ sqrt(Δ̄_{2,ℓ})
   alpha_min: 1.0              # lower bound for secret scaling
   alpha_max: 1.1              # upper bound for secret scaling
   eta_srv: 1.0                # server update scale for aggregated delta
   local_epochs: 1             # local unlearning epochs per copy
   local_max_steps: null       # optional max steps per copy (overrides epochs if set)
   auto_balance_local_max_steps: true  # if true and local_max_steps is null, set local_max_steps so that local_max_steps * rounds_R ~= original total steps N
-  clip_update_norm: null      # optional global l2 clip on each copy's delta
+  clip_update_norm: null      # optional global l2 clip on each copy's delta (non-layer params or fallback)
+  clip_update_norm_per_layer: null  # optional list[L]: per-layer L2 clip thresholds (applied independently per layer)
   use_orthogonal_reparam: false  # identity by default; safe to enable once implemented
