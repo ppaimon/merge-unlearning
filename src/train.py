@@ -58,8 +58,28 @@ def main(cfg: DictConfig):
 
     if trainer_args.do_train:
         trainer.train()
-        trainer.save_state()
-        trainer.save_model(trainer_args.output_dir)
+        # Save state and model with robust fallback for certain Accelerate+DeepSpeed combos
+        try:
+            trainer.save_state()
+            trainer.save_model(trainer_args.output_dir)
+        except AttributeError as e:
+            # Some Accelerate versions may not expose deepspeed_config on Accelerator
+            # Fallback: only on main process, unwrap and save the raw model + tokenizer
+            if "deepspeed_config" in str(e):
+                acc = getattr(trainer, "accelerator", None)
+                is_main = True if acc is None else acc.is_main_process
+                if is_main:
+                    try:
+                        model_to_save = (
+                            acc.unwrap_model(trainer.model) if acc is not None else trainer.model
+                        )
+                        model_to_save.save_pretrained(trainer_args.output_dir)
+                        if getattr(trainer, "tokenizer", None) is not None:
+                            trainer.tokenizer.save_pretrained(trainer_args.output_dir)
+                    except Exception:
+                        raise e
+            else:
+                raise
 
     if trainer_args.do_eval:
         trainer.evaluate(metric_key_prefix="eval")
