@@ -14,11 +14,11 @@ GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-4}          # gradient accumulation; range:
 PUM_COPIES_M=${PUM_COPIES_M:-4}                  # number of perturbed copies per round (m); range: 4–16
 PUM_ROUNDS_R=${PUM_ROUNDS_R:-1}                  # number of PUM rounds (R); range: 1–3
 PUM_ALPHA_MIN=${PUM_ALPHA_MIN:-1.0}              # secret scaling min α_min (≥1); range: 1.0–1.5
-PUM_ALPHA_MAX=${PUM_ALPHA_MAX:-1.0}              # secret scaling max α_max; range: α_min–1.5
+PUM_ALPHA_MAX=${PUM_ALPHA_MAX:-1.1}              # secret scaling max α_max; range: α_min–1.5
 PUM_ETA_SRV=${PUM_ETA_SRV:-1.0}                  # server step size η_srv; range: 0.5–1.5
 PUM_THETA_REF_BETA=${PUM_THETA_REF_BETA:-0.8}    # EMA β for DP clipping reference; range: 0.7–0.9
 PUM_JITTER_TAU=${PUM_JITTER_TAU:-0.0}            # tiny jitter τ per copy (std); range: 0–1e-3 (0 disables)
-PUM_USE_REPARAM=${PUM_USE_REPARAM:-false}        # per-copy orthogonal/permutation reparameterization; recommend true if stable
+PUM_USE_REPARAM=${PUM_USE_REPARAM:-true}        # per-copy orthogonal/permutation reparameterization; recommend true if stable
 
 # Local unlearning budget (per copy)
 PUM_LOCAL_EPOCHS=${PUM_LOCAL_EPOCHS:-1}          # local epochs per copy; range: 1–3
@@ -29,9 +29,9 @@ PUM_CLIP_UPDATE_NORM=${PUM_CLIP_UPDATE_NORM:-null}               # global L2 cli
 PUM_CLIP_UPDATE_PER_LAYER=${PUM_CLIP_UPDATE_PER_LAYER:-null}     # per-layer L2 clips; e.g., "[5,5,...]"
 
 # DP calibration and publication
-PUM_PER_LAYER_NOISE=${PUM_PER_LAYER_NOISE:-false} # true: calibrate per-layer σ_ℓ; recommended when using DP
-DP_EPSILON=${DP_EPSILON:-null}                    # target ε; range: 2–8 (dataset/task-dependent)
-DP_DELTA=${DP_DELTA:-null}                        # target δ; e.g., 2.5e-5 for TOFU (1/(10N)); range: 1e-8–1e-5
+PUM_PER_LAYER_NOISE=${PUM_PER_LAYER_NOISE:-true} # true: calibrate per-layer σ_ℓ; recommended when using DP
+DP_EPSILON=${DP_EPSILON:-8}                    # target ε; range: 2–8 (dataset/task-dependent)
+DP_DELTA=${DP_DELTA:-0.000025}                        # target δ; e.g., 2.5e-5 for TOFU (1/(10N)); range: 1e-8–1e-5
 DP_RDP_ORDERS=${DP_RDP_ORDERS:-[1.5,2,3,4,8,16,32,64,128]} # RDP orders sweep
 DP_PER_LAYER_ALLOC=${DP_PER_LAYER_ALLOC:-auto}    # noise allocation across layers: auto|min-var, equalized, varmin
 DP_SENS_TOTAL_L2=${DP_SENS_TOTAL_L2:-null}       # total sensitivity Δ̄_2 (≈ 2 C_total); used for single-σ or fallback
@@ -45,7 +45,9 @@ PUM_SIGMA_PER_LAYER=${PUM_SIGMA_PER_LAYER:-null}  # per-layer σ list if DP not 
 # Server-side DP clipping of publication center (θ~)
 PUM_SERVER_CENTER_CLIP=${PUM_SERVER_CENTER_CLIP:-null}          # null:auto (enable if DP sensitivities/C provided); true/false
 PUM_CENTER_CLIP_C_GLOBAL=${PUM_CENTER_CLIP_C_GLOBAL:-null}      # optional global C for non-layer params (Δ̄_2=2C)
-PUM_CENTER_CLIP_C_PER_LAYER=${PUM_CENTER_CLIP_C_PER_LAYER:-null}# optional per-layer C list (Δ̄_{2,ℓ}=2C_ℓ)
+PUM_CENTER_CLIP_C_PER_LAYER=${PUM_CENTER_CLIP_C_PER_LAYER:-null}
+
+
 PUM_CENTER_CLIP_Q=${PUM_CENTER_CLIP_Q:-0.95}                    # quantile q for C_ℓ (0.90–0.99)
 PUM_CENTER_CLIP_KAPPA=${PUM_CENTER_CLIP_KAPPA:-1.25}            # scaling κ for C_ℓ (1.1–1.5)
 PUM_CENTER_CLIP_GAMMA=${PUM_CENTER_CLIP_GAMMA:-1.3}             # round scaling γ for multi-round
@@ -140,25 +142,25 @@ fi
 ##########################################
 # 模型（默认启用 8B；按需打开其它）
 MODELS=(
-  # "Llama-3.2-1B-Instruct"
+  "Llama-3.2-1B-Instruct"
   # "Llama-3.2-3B-Instruct"
-  "Llama-3.1-8B-Instruct"
+  # "Llama-3.1-8B-Instruct"
 )
 
 # PUM 的内层方法 + 实验配置对
 # 说明：外层 trainer 固定为 PUM；这里配置 inner_handler 与实验配置
 PUM_INNERS_EXPERIMENTS=(
-  "GradAscent unlearn/tofu/default.yaml"
+  # "GradAscent unlearn/tofu/default.yaml"
   # "GradDiff   unlearn/tofu/default.yaml"
-  # "NPO        unlearn/tofu/default.yaml"
+  "NPO        unlearn/tofu/default.yaml"
   # "DPO        unlearn/tofu/idk.yaml"
 )
 
 # 数据 split（forget/holdout/retain）
 SPLITS=(
-  # "forget01 holdout01 retain99"
+  "forget01 holdout01 retain99"
   # "forget05 holdout05 retain95"
-  "forget10 holdout10 retain90"
+  # "forget10 holdout10 retain90"
 )
 
 ##########################################

@@ -69,11 +69,18 @@ def _apply_state_dict_delta(model: nn.Module, delta: Dict[str, torch.Tensor], sc
 
 
 def _diff_state_dict(a: Dict[str, torch.Tensor], b: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    # return (a - b)
-    out = {}
+    # Robust difference: intersect keys and match shapes/dtypes
+    out: Dict[str, torch.Tensor] = {}
     for k, va in a.items():
-        vb = b[k]
-        out[k] = va - vb
+        vb = b.get(k)
+        if vb is None:
+            continue
+        if va.shape != vb.shape:
+            continue
+        try:
+            out[k] = va - vb
+        except Exception:
+            continue
     return out
 
 
@@ -172,7 +179,17 @@ class PUM(FinetuneTrainer):
         self.rounds_R = int(rounds_R)
         self.sigma = float(sigma)
         self.sigma_per_layer = list(sigma_per_layer) if sigma_per_layer is not None else None
-        self.per_layer_noise = bool(per_layer_noise)
+        # Robust bool parsing for Hydra CLI overrides (which may come as strings)
+        def _as_bool(x, default=False):
+            if isinstance(x, bool) or x is None:
+                return bool(x) if x is not None else default
+            if isinstance(x, str):
+                s = x.strip().lower()
+                if s in ("true", "1", "yes", "y"): return True
+                if s in ("false", "0", "no", "n", "null", "none", ""): return False
+            return bool(x)
+
+        self.per_layer_noise = _as_bool(per_layer_noise, default=False)
         # DP args
         self.dp_epsilon = float(dp_epsilon) if dp_epsilon is not None else None
         self.dp_delta = float(dp_delta) if dp_delta is not None else None
@@ -182,10 +199,35 @@ class PUM(FinetuneTrainer):
         self.dp_sens_per_layer_l2 = (
             list(dp_sensitivity_per_layer_l2) if dp_sensitivity_per_layer_l2 is not None else None
         )
-        self.dp_rdp_orders = (
-            list(dp_rdp_orders) if dp_rdp_orders is not None else None
-        )
-        self.dp_use_worstcase_alpha = bool(dp_use_worstcase_alpha)
+        # Parse orders which may arrive as YAML list or CLI string like "[1.5,2,4]"
+        def _as_list_of_numbers(x):
+            if x is None:
+                return None
+            if isinstance(x, (list, tuple)):
+                return [float(v) for v in x]
+            if isinstance(x, str):
+                if x.strip().lower() in ("null", "none", ""):
+                    return None
+                import ast
+                try:
+                    val = ast.literal_eval(x)
+                    if isinstance(val, (list, tuple)):
+                        return [float(v) for v in val]
+                except Exception:
+                    pass
+                # fallback: comma-separated
+                try:
+                    return [float(v) for v in x.split(',') if v.strip()]
+                except Exception:
+                    return None
+            # last resort
+            try:
+                return [float(x)]
+            except Exception:
+                return None
+
+        self.dp_rdp_orders = _as_list_of_numbers(dp_rdp_orders)
+        self.dp_use_worstcase_alpha = _as_bool(dp_use_worstcase_alpha, default=True)
         self.dp_per_layer_allocation = str(dp_per_layer_allocation).lower().strip()
         if self.dp_per_layer_allocation not in ("auto", "equalized", "varmin"):
             logger.warning(
@@ -206,20 +248,39 @@ class PUM(FinetuneTrainer):
         self.center_clip_quantile_q = float(center_clip_quantile_q)
         self.center_clip_quantile_kappa = float(center_clip_quantile_kappa)
         self.center_clip_round_gamma = float(center_clip_round_gamma)
-        self.center_clip_ref_model_paths = (
-            list(center_clip_ref_model_paths) if center_clip_ref_model_paths is not None else None
-        )
+        # Parse ref model paths: YAML list or CLI string list
+        def _as_list_of_strings(x):
+            if x is None:
+                return None
+            if isinstance(x, (list, tuple)):
+                return [str(v) for v in x]
+            if isinstance(x, str):
+                if x.strip().lower() in ("null", "none", ""):
+                    return None
+                import ast
+                try:
+                    val = ast.literal_eval(x)
+                    if isinstance(val, (list, tuple)):
+                        return [str(v) for v in val]
+                except Exception:
+                    pass
+                if "," in x:
+                    return [s.strip() for s in x.split(',') if s.strip()]
+                return [x.strip()]
+            return [str(x)]
+
+        self.center_clip_ref_model_paths = _as_list_of_strings(center_clip_ref_model_paths)
         self.jitter_tau = float(jitter_tau)
         self.local_epochs = int(local_epochs)
         self.local_max_steps = (
             int(local_max_steps) if local_max_steps is not None else None
         )
-        self.auto_balance_local_max_steps = bool(auto_balance_local_max_steps)
+        self.auto_balance_local_max_steps = _as_bool(auto_balance_local_max_steps, default=True)
         self.clip_update_norm = clip_update_norm
         self.clip_update_norm_per_layer = (
             list(clip_update_norm_per_layer) if clip_update_norm_per_layer is not None else None
         )
-        self.use_orthogonal_reparam = use_orthogonal_reparam
+        self.use_orthogonal_reparam = _as_bool(use_orthogonal_reparam, default=False)
 
         if self.alpha_min < 1.0:
             self.alpha_min = 1.0
@@ -261,7 +322,7 @@ class PUM(FinetuneTrainer):
                 or (self.center_clip_ref_model_paths is not None and len(self.center_clip_ref_model_paths) > 0)
             )
         else:
-            self.server_center_clipping = bool(server_center_clipping)
+            self.server_center_clipping = _as_bool(server_center_clipping, default=False)
 
         # Initialize EMA reference and previous published mean (server coords)
         self._theta_ref_sd: Dict[str, torch.Tensor] = _state_dict_tensors(self.model)
@@ -741,11 +802,10 @@ class PUM(FinetuneTrainer):
                 # Use a single orthogonal over head_dim, repeated across heads
                 head_dim = int(getattr(attn, "head_dim", 0) or (attn.q_proj.weight.shape[0] // getattr(attn, "num_heads", 1)))
                 if head_dim > 0:
-                    # Random orthogonal via QR
-                    A = torch.randn(head_dim, head_dim, device=attn.q_proj.weight.device, dtype=attn.q_proj.weight.dtype)
-                    # Ensure well-conditioned
+                    # Random orthogonal via QR (compute in float32 on CPU to avoid bf16 CPU QR issues)
+                    A = torch.randn(head_dim, head_dim, device="cpu", dtype=torch.float32)
                     Q, _ = torch.linalg.qr(A)
-                    entry["R_sub"] = Q.detach().to(attn.q_proj.weight.dtype)
+                    entry["R_sub"] = Q.detach().to(device=attn.q_proj.weight.device, dtype=attn.q_proj.weight.dtype)
                     # Store head counts for reshape logic
                     entry["n_q_heads"] = torch.tensor(int(getattr(attn, "num_heads", 0)), device="cpu")
                     entry["n_kv_heads"] = torch.tensor(int(getattr(attn, "num_key_value_heads", getattr(attn, "num_heads", 0))), device="cpu")
@@ -790,14 +850,26 @@ class PUM(FinetuneTrainer):
                 def _left_mul_block(weight: torch.Tensor, H: int, D: int, R: torch.Tensor):
                     # weight: (H*D, M) -> reshape (H,D,M), apply R @ (D,M) per-head
                     w = weight.view(H, D, -1)
-                    w = torch.einsum("ij,hjm->him", R, w)
-                    return w.reshape(H * D, -1)
+                    if w.device.type == "cpu":
+                        w32 = w.float()
+                        R32 = R.float()
+                        w32 = torch.einsum("ij,hjm->him", R32, w32)
+                        return w32.to(weight.dtype).reshape(H * D, -1)
+                    else:
+                        w = torch.einsum("ij,hjm->him", R, w)
+                        return w.reshape(H * D, -1)
 
                 def _right_mul_block(weight: torch.Tensor, H: int, D: int, R: torch.Tensor):
                     # weight: (M, H*D) -> reshape (M,H,D), apply (M,H,D) @ R^T on last dim
                     w = weight.view(-1, H, D)
-                    w = torch.einsum("mhd,dj->mhj", w, R.T)
-                    return w.reshape(-1, H * D)
+                    if w.device.type == "cpu":
+                        w32 = w.float()
+                        R32 = R.float()
+                        w32 = torch.einsum("mhd,dj->mhj", w32, R32.T)
+                        return w32.to(weight.dtype).reshape(-1, H * D)
+                    else:
+                        w = torch.einsum("mhd,dj->mhj", w, R.T)
+                        return w.reshape(-1, H * D)
 
                 with torch.no_grad():
                     attn.q_proj.weight.copy_(
@@ -852,13 +924,25 @@ class PUM(FinetuneTrainer):
 
                 def _left_inv(weight: torch.Tensor, H: int, D: int, R: torch.Tensor):
                     w = weight.view(H, D, -1)
-                    w = torch.einsum("ij,hjm->him", R.T, w)
-                    return w.reshape(H * D, -1)
+                    if w.device.type == "cpu":
+                        w32 = w.float()
+                        RT32 = R.float().T
+                        w32 = torch.einsum("ij,hjm->him", RT32, w32)
+                        return w32.to(weight.dtype).reshape(H * D, -1)
+                    else:
+                        w = torch.einsum("ij,hjm->him", R.T, w)
+                        return w.reshape(H * D, -1)
 
                 def _right_inv(weight: torch.Tensor, H: int, D: int, R: torch.Tensor):
                     w = weight.view(-1, H, D)
-                    w = torch.einsum("mhd,dj->mhj", w, R)
-                    return w.reshape(-1, H * D)
+                    if w.device.type == "cpu":
+                        w32 = w.float()
+                        R32 = R.float()
+                        w32 = torch.einsum("mhd,dj->mhj", w32, R32)
+                        return w32.to(weight.dtype).reshape(-1, H * D)
+                    else:
+                        w = torch.einsum("mhd,dj->mhj", w, R)
+                        return w.reshape(-1, H * D)
 
                 q_w = base + "self_attn.q_proj.weight"
                 k_w = base + "self_attn.k_proj.weight"
@@ -999,12 +1083,12 @@ class PUM(FinetuneTrainer):
         # Optionally set local_max_steps to match original total steps budget
         self._maybe_set_auto_local_max_steps()
 
-        # Optionally set sigma/sigma_per_layer from DP budget (DP takes precedence over manual if provided)
-        self._calibrate_sigma_from_dp()
-
-        # If requested and references provided, compute quantile-based C_l once
+        # If requested and references provided, compute quantile-based C_l once (before DP calibration)
         if self.server_center_clipping:
             self._maybe_init_center_C_from_quantile()
+
+        # Optionally set sigma/sigma_per_layer from DP budget (DP takes precedence over manual if provided)
+        self._calibrate_sigma_from_dp()
 
         for r in range(1, self.rounds_R + 1):
             # Update clipping reference via EMA of last round's published mean (server coords)
@@ -1018,6 +1102,9 @@ class PUM(FinetuneTrainer):
                             self._theta_ref_sd[n] = pub.detach().clone()
                         else:
                             self._theta_ref_sd[n] = (1.0 - beta) * prev_ref + beta * pub
+
+            # Re-run DP calibration each round to pick up newly available C_l and updated S_alpha
+            self._calibrate_sigma_from_dp()
 
             # Draw zero-sum base noises
             per_param_sigma = self._build_per_param_sigma()
@@ -1038,8 +1125,14 @@ class PUM(FinetuneTrainer):
             # Streaming stats
             S0 = 0.0
             S1 = _zero_like_param_dict(self.model)
-            # Per-round publication mean accumulator in server coordinates
+            # Per-round publication mean accumulator in server coordinates (aligned T^{-1} of published params)
             pub_sum_server = _zero_like_param_dict(self.model)
+            # Per-round per-layer norms from aligned published models for quantile C_l update
+            round_norms_per_layer: Optional[List[List[float]]] = (
+                [[] for _ in range(int(self._num_layers))]
+                if (self._num_layers is not None and int(self._num_layers) > 0)
+                else None
+            )
             # Server-side center clipping delta (relative to current params)
             cur_sd = _state_dict_tensors(self.model)
             center_delta = None
@@ -1077,26 +1170,32 @@ class PUM(FinetuneTrainer):
                 # Apply reparameterization (identity now)
                 self._apply_T(model_k, T_k)
 
-                # Snapshot pre-training params in transformed coordinate
-                before_sd = _state_dict_tensors(model_k)
-
-                # Accumulate server-coordinate publication mean for this round: theta + center_delta + eps + xi
-                with torch.no_grad():
-                    for n, _ in _named_params(self.model):
-                        v = cur_sd[n]
-                        if center_delta is not None:
-                            v = v + center_delta[n].to(v.device)
-                        v = v + eps_k[n].to(v.device)
-                        if xi_k is not None:
-                            v = v + xi_k[n].to(v.device)
-                        pub_sum_server[n].add_(v)
-
-                # Build inner args and inner trainer
+                # Build inner args and inner trainer (may wrap/modify model)
                 inner_out_dir = os.path.join(
                     str(self.args.output_dir), f"pum_round{r}_copy{k+1}"
                 )
                 inner_args = self._make_inner_args(inner_out_dir)
                 inner_trainer = self._instantiate_inner_trainer(model_k, inner_args)
+
+                # Snapshot pre-training params in transformed coordinate (after any trainer wrapping, before train)
+                before_sd = _state_dict_tensors(inner_trainer.model)
+                # Align published params back to server coordinates via T^{-1} and accumulate for EMA/quantiles
+                before_sd_aligned = self._apply_T_inv_to_update(before_sd, T_k)
+                with torch.no_grad():
+                    for n, _ in _named_params(self.model):
+                        pub_sum_server[n].add_(before_sd_aligned[n].to(pub_sum_server[n].device))
+                # Collect per-layer norms vs base for quantile-based C_l
+                if round_norms_per_layer is not None:
+                    for name, base_v in self._theta_base_sd.items():
+                        li = self._param_layer_index(name)
+                        if li is None or li >= len(round_norms_per_layer):
+                            continue
+                        v = before_sd_aligned.get(name, None)
+                        if v is None:
+                            continue
+                        dv = (v.detach().cpu() - base_v).float().view(-1)
+                        nrm = float(torch.linalg.norm(dv, ord=2).item())
+                        round_norms_per_layer[li].append(nrm)
 
                 # Local unlearning train
                 inner_trainer.train()
@@ -1111,11 +1210,12 @@ class PUM(FinetuneTrainer):
                 # Optional clipping
                 delta_k = self._clip_update(delta_k)
 
-                # Streaming harmonic-normalized accumulation
+                # Streaming harmonic-normalized accumulation (intersection of keys)
                 w = 1.0 / max(alpha_k, 1e-6)
                 S0 += w
-                for n in S1:
-                    S1[n].add_(w * delta_k[n].to(S1[n].device))
+                for n, dv in delta_k.items():
+                    if n in S1:
+                        S1[n].add_(w * dv.to(S1[n].device))
 
                 # Free up memory explicitly
                 del inner_trainer
@@ -1133,6 +1233,22 @@ class PUM(FinetuneTrainer):
             # Store published mean (server coords) for next-round EMA reference
             m = float(self.copies_m)
             self._pub_mean_prev_sd = {n: (pub_sum_server[n] / m).detach().clone() for n in pub_sum_server}
+
+            # Update quantile-based C_l from this round's aligned published models (public-only)
+            if round_norms_per_layer is not None:
+                q = min(max(self.center_clip_quantile_q, 0.0), 1.0)
+                kappa = max(self.center_clip_quantile_kappa, 0.0)
+                gamma = self.center_clip_round_gamma if (self.rounds_R and self.rounds_R > 1) else 1.0
+                Cs: List[float] = []
+                for li in range(len(round_norms_per_layer)):
+                    vals = round_norms_per_layer[li]
+                    if not vals:
+                        Cs.append(0.0)
+                    else:
+                        t = torch.tensor(vals, dtype=torch.float32)
+                        c_l = float(torch.quantile(t, q).item()) * kappa * gamma
+                        Cs.append(c_l)
+                self._center_clip_C_from_quantile = Cs
 
         # End of rounds; switch to eval mode for downstream evaluate()
         self.model.eval()

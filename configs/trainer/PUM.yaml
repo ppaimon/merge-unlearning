@@ -19,10 +19,21 @@ method_args:
   dp_sensitivity_per_layer_l2: null   # Optional list[L] Δ̄_{2,ℓ}; else uses clip_update_norm_per_layer or uniform split of total
   dp_rdp_orders: [1.1, 2, 4, 8, 16, 32, 64]
   dp_use_worstcase_alpha: true
-  dp_per_layer_allocation: equalized   # {equalized,varmin}: σ_ℓ ∝ Δ̄_{2,ℓ} or σ_ℓ ∝ sqrt(Δ̄_{2,ℓ})
+  dp_per_layer_allocation: equalized   # {auto,equalized,varmin}: choose-smaller-noise or fixed
   alpha_min: 1.0              # lower bound for secret scaling
   alpha_max: 1.1              # upper bound for secret scaling
   eta_srv: 1.0                # server update scale for aggregated delta
+  # Publication center (server-side) and EMA reference
+  theta_ref_beta: 0.8
+  server_center_clipping: null
+  center_clip_C_global: null
+  center_clip_C_per_layer: null
+  # Public-only quantile-based thresholds
+  center_clip_quantile_q: 0.95
+  center_clip_quantile_kappa: 1.25
+  center_clip_round_gamma: 1.3
+  center_clip_ref_model_paths: null
+  jitter_tau: 0.0
   local_epochs: 1             # local unlearning epochs per copy
   local_max_steps: null       # optional max steps per copy (overrides epochs if set)
   auto_balance_local_max_steps: true  # if true and local_max_steps is null, set local_max_steps so that local_max_steps * rounds_R ~= original total steps N
