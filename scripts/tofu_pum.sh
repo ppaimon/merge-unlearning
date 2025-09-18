@@ -7,6 +7,10 @@ set -euo pipefail
 # - Edit here or override via environment variables before running.
 ##########################################
 # Training throughput
+
+
+
+
 BATCH_SIZE_PER_GPU=${BATCH_SIZE_PER_GPU:-2}       # per-device batch size; range: 1–8 (depends on VRAM)
 GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-4}          # gradient accumulation; range: 1–16 (match global batch)
 
@@ -18,7 +22,7 @@ PUM_ALPHA_MAX=${PUM_ALPHA_MAX:-1.1}              # secret scaling max α_max; ra
 PUM_ETA_SRV=${PUM_ETA_SRV:-1.0}                  # server step size η_srv; range: 0.5–1.5
 PUM_THETA_REF_BETA=${PUM_THETA_REF_BETA:-0.8}    # EMA β for DP clipping reference; range: 0.7–0.9
 PUM_JITTER_TAU=${PUM_JITTER_TAU:-0.0}            # tiny jitter τ per copy (std); range: 0–1e-3 (0 disables)
-PUM_USE_REPARAM=${PUM_USE_REPARAM:-true}        # per-copy orthogonal/permutation reparameterization; recommend true if stable
+PUM_USE_REPARAM=${PUM_USE_REPARAM:-false}        # per-copy orthogonal/permutation reparameterization; recommend true if stable
 
 # Local unlearning budget (per copy)
 PUM_LOCAL_EPOCHS=${PUM_LOCAL_EPOCHS:-1}          # local epochs per copy; range: 1–3
@@ -150,9 +154,9 @@ MODELS=(
 # PUM 的内层方法 + 实验配置对
 # 说明：外层 trainer 固定为 PUM；这里配置 inner_handler 与实验配置
 PUM_INNERS_EXPERIMENTS=(
-  # "GradAscent unlearn/tofu/default.yaml"
+   "GradAscent unlearn/tofu/default.yaml"
   # "GradDiff   unlearn/tofu/default.yaml"
-  "NPO        unlearn/tofu/default.yaml"
+  # "NPO        unlearn/tofu/default.yaml"
   # "DPO        unlearn/tofu/idk.yaml"
 )
 
