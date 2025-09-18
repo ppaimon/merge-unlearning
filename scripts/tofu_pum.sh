@@ -12,7 +12,7 @@ GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-4}          # gradient accumulation; range:
 
 # PUM outer loop
 PUM_COPIES_M=${PUM_COPIES_M:-2}                  # number of perturbed copies per round (m); range: 4–16
-PUM_ROUNDS_R=${PUM_ROUNDS_R:-1}                  # number of PUM rounds (R); range: 1–3
+PUM_ROUNDS_R=${PUM_ROUNDS_R:-2}                  # number of PUM rounds (R); range: 1–3
 PUM_ALPHA_MIN=${PUM_ALPHA_MIN:-1.0}              # secret scaling min α_min (≥1); range: 1.0–1.5
 PUM_ALPHA_MAX=${PUM_ALPHA_MAX:-1.1}              # secret scaling max α_max; range: α_min–1.5
 PUM_ETA_SRV=${PUM_ETA_SRV:-1.0}                  # server step size η_srv; range: 0.5–1.5
