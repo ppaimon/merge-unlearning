@@ -1,3 +1,5 @@
+# /home/ecs-user/PUM/src/train.py
+
 import hydra
 from omegaconf import DictConfig
 from data import get_data, get_collators

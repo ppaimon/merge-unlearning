@@ -1,4 +1,4 @@
-# pum.py — Perturb–Unlearn–Merge (PUM) meta-trainer
+# /home/ecs-user/PUM/src/trainer/unlearn/pum.py — Perturb–Unlearn–Merge (PUM) meta-trainer
 # Public-only C_ℓ → Δ̄_{2,ℓ} → DP σ; correlated α·ε_k perturb → inner unlearning → server average.
 # Deterministic seeds, tiny jitter, optional T (orthogonal + permute) reparam, center clipping with EMA ref.
 # Multi-GPU safe diffs under DeepSpeed/Accelerate (gather full, unsharded state before diff).
