@@ -621,43 +621,122 @@ class PUM(FinetuneTrainer):
 
     
     def _apply_sigma_safety_clip(self) -> None:
-        # Clip σ by relative RMS; per-layer if available — use the CURRENT round reference θ_ref.
+        """
+        Cap/floor σ relative to RMS(θ_ref). When DP is ON and PUM_DP_STRICT=1 (default),
+        we do NOT apply any upper cap that would reduce the DP-calibrated σ; we only log it.
+        Floors are always applied (privacy-safe).
+        Also logs detailed pre/post values and per-layer limits if PUM_LOG_SIGMA_DETAIL=1.
+        """
+        # ----- config -----
         try:
             sigma_rel_clip = float(os.environ.get("PUM_SIGMA_REL_CLIP", "0.25"))
         except (TypeError, ValueError):
             sigma_rel_clip = 0.25
         sigma_rel_clip = max(sigma_rel_clip, 0.0)
 
-        # Use current reference stats, fall back to base
+        min_rel = float(getattr(self, "sigma_min_rel", 0.0) or 0.0)
+        dp_on = (self.dp_epsilon is not None and self.dp_delta is not None)
+        dp_strict = bool(int(os.environ.get("PUM_DP_STRICT", "1"))) if dp_on else False
+        log_detail = os.environ.get("PUM_LOG_SIGMA_DETAIL", "0").strip() not in ("", "0", "false", "False")
+
+        # ----- reference stats (current round) -----
         cur_rms_global = self._global_rms_from_sd(self._theta_ref_sd) if hasattr(self, "_theta_ref_sd") else self._base_global_rms
         layer_rms_list = self._compute_layer_rms_from_sd(self._theta_ref_sd) if hasattr(self, "_theta_ref_sd") else self._layer_rms
 
-        # Max-relative clip
-        if sigma_rel_clip > 0.0:
-            if self.sigma_per_layer is not None and layer_rms_list is not None:
-                new_vals = []
-                clamped = False
-                for idx, s in enumerate(self.sigma_per_layer):
-                    lim_i = sigma_rel_clip * max(float(layer_rms_list[idx] if idx < len(layer_rms_list) else 0.0), 1e-8)
-                    s0 = float(s or 0.0)
-                    s_val = min(max(s0, 0.0), lim_i)
-                    if s_val != s0:
-                        clamped = True
-                    new_vals.append(s_val)
-                self.sigma_per_layer = new_vals
-                if clamped:
-                    logger.info("PUM: per-layer σ clipped by rel %.3g to layer RMS (current ref).", sigma_rel_clip)
-            elif self.sigma_per_layer is not None and cur_rms_global > 0.0:
-                limit = sigma_rel_clip * max(cur_rms_global, 1e-8)
-                self.sigma_per_layer = [min(max(float(s or 0.0), 0.0), limit) for s in self.sigma_per_layer]
-                logger.info("PUM: per-layer σ clipped to <= %.6g based on global RMS (current ref).", limit)
-            elif cur_rms_global > 0.0:
-                limit = sigma_rel_clip * max(cur_rms_global, 1e-8)
-                self.sigma = min(max(float(self.sigma or 0.0), 0.0), limit)
-                logger.info("PUM: σ clipped to <= %.6g (rel clip=%.3g, ref_rms=%.6g)", limit, sigma_rel_clip, cur_rms_global)
+        # Track pre/post for logging
+        pre_scalar = float(self.sigma or 0.0)
+        pre_list = [float(s or 0.0) for s in (self.sigma_per_layer or [])]
 
-        # Min-relative floor
-        min_rel = float(getattr(self, "sigma_min_rel", 0.0) or 0.0)
+        # ----- build per-layer limits -----
+        limits = None
+        if self.sigma_per_layer is not None and layer_rms_list is not None:
+            L = min(len(self.sigma_per_layer), len(layer_rms_list))
+            limits = [sigma_rel_clip * max(float(layer_rms_list[i]), 1e-8) for i in range(L)]
+        elif self.sigma_per_layer is not None and cur_rms_global > 0.0:
+            limits = [sigma_rel_clip * max(cur_rms_global, 1e-8) for _ in self.sigma_per_layer]
+        elif cur_rms_global > 0.0:
+            limits = sigma_rel_clip * max(cur_rms_global, 1e-8)  # scalar limit
+
+        # ----- apply (or skip) the upper cap -----
+        clipped_count = 0
+        clipped_examples = []  # (i, pre, limit, post, ratio)
+
+        def _maybe_log_detail():
+            if not log_detail:
+                return
+            if isinstance(limits, list) and self.sigma_per_layer is not None:
+                ratios = []
+                for i, (pre, lim, post) in enumerate(zip(pre_list[:len(limits)], limits, self.sigma_per_layer[:len(limits)])):
+                    if lim <= 0: continue
+                    r = pre / lim
+                    if post < pre:  # actually clipped
+                        ratios.append(r)
+                        clipped_examples.append((i, pre, lim, post, r))
+                ratios.sort()
+                if ratios:
+                    import statistics as _stats
+                    logger.info("PUM σ-clip summary: clipped %d/%d layers; ratio(pre/limit) median=%.3g, max=%.3g",
+                                len(ratios), len(limits), _stats.median(ratios), max(ratios))
+                else:
+                    logger.info("PUM σ-clip summary: no layers clipped by the upper cap.")
+                # Print up to the worst 8
+                clipped_examples.sort(key=lambda t: t[4], reverse=True)
+                for (i, pre, lim, post, r) in clipped_examples[:8]:
+                    logger.info("PUM σ-clip detail: layer %d: σ_DP=%.6g, limit=%.6g, used=%.6g, ratio=%.3f%s",
+                                i, pre, lim, post, r, " [CLIPPED]" if post < pre else "")
+            else:
+                # scalar σ
+                if isinstance(limits, float) and limits > 0:
+                    post = float(self.sigma or 0.0)
+                    r = (pre_scalar / limits) if limits > 0 else float("inf")
+                    msg = " [CLIPPED]" if post < pre_scalar else ""
+                    logger.info("PUM σ-clip summary: scalar σ_DP=%.6g, limit=%.6g, used=%.6g, ratio=%.3f%s",
+                                pre_scalar, limits, post, r, msg)
+
+        # Upper cap: only if NOT in DP-strict mode
+        if sigma_rel_clip > 0.0 and limits is not None:
+            if dp_on and dp_strict:
+                # DP strict: do not reduce σ; only warn if it WOULD have clipped
+                would_clip = False
+                if isinstance(limits, list) and self.sigma_per_layer is not None:
+                    for i in range(min(len(self.sigma_per_layer), len(limits))):
+                        if self.sigma_per_layer[i] > limits[i]:
+                            would_clip = True
+                            break
+                elif isinstance(limits, float):
+                    if pre_scalar > limits:
+                        would_clip = True
+                if would_clip:
+                    logger.warning(
+                        "PUM(DP): upper σ cap (rel=%.3g) WOULD reduce the DP-calibrated σ. "
+                        "This would weaken the DP guarantee. Cap skipped because PUM_DP_STRICT=1.",
+                        sigma_rel_clip
+                    )
+                # leave σ as-is (no upper clipping), then proceed to floors
+            else:
+                # Apply upper cap
+                if self.sigma_per_layer is not None and isinstance(limits, list):
+                    new_vals = []
+                    for i, s in enumerate(self.sigma_per_layer[:len(limits)]):
+                        s0 = float(s or 0.0)
+                        s1 = min(max(s0, 0.0), limits[i])
+                        if s1 < s0: clipped_count += 1
+                        new_vals.append(s1)
+                    self.sigma_per_layer = new_vals
+                    if clipped_count > 0:
+                        logger.info("PUM: per-layer σ clipped by rel %.3g to layer RMS (current ref).", sigma_rel_clip)
+                elif isinstance(limits, list) and self.sigma_per_layer is not None:
+                    # fallback already covered above
+                    pass
+                elif isinstance(limits, float):
+                    s0 = float(self.sigma or 0.0)
+                    s1 = min(max(s0, 0.0), limits)
+                    if s1 < s0:
+                        clipped_count = 1
+                        logger.info("PUM: σ clipped to <= %.6g (rel clip=%.3g, ref_rms=%.6g)", limits, sigma_rel_clip, cur_rms_global)
+                    self.sigma = s1
+
+        # ----- apply min floor (always safe) -----
         if min_rel > 0.0:
             if self.sigma_per_layer is not None and layer_rms_list is not None:
                 new_vals = []
@@ -674,23 +753,15 @@ class PUM(FinetuneTrainer):
                     logger.info("PUM: per-layer σ floored by rel %.3g to layer RMS (current ref).", min_rel)
             elif self.sigma_per_layer is not None and cur_rms_global > 0.0:
                 floor = min_rel * cur_rms_global
-                new_vals = []
-                floored = False
-                for s in self.sigma_per_layer:
-                    s_val = float(s or 0.0)
-                    if s_val < floor:
-                        s_val = floor
-                        floored = True
-                    new_vals.append(s_val)
-                self.sigma_per_layer = new_vals
-                if floored:
-                    logger.info("PUM: per-layer σ floored to >= %.6g based on global RMS (current ref).", floor)
+                self.sigma_per_layer = [max(float(s or 0.0), floor) for s in self.sigma_per_layer]
+                logger.info("PUM: per-layer σ floored to >= %.6g based on global RMS (current ref).", floor)
             elif cur_rms_global > 0.0:
                 floor = min_rel * cur_rms_global
                 s_val = float(self.sigma or 0.0)
                 if s_val < floor:
                     self.sigma = floor
                 logger.info("PUM: σ floored to >= %.6g (min rel=%.3g, ref_rms=%.6g)", floor, min_rel, cur_rms_global)
+
 
 
     def _calibrate_sigma_from_dp(self) -> None:
@@ -1550,4 +1621,31 @@ class PUM(FinetuneTrainer):
                 delta[name] = -q if s == 0.0 else (torch.zeros_like(q) if s == 1.0 else (s - 1.0) * q)
             else:
                 delta[name] = torch.zeros_like(q)
+            # --- diagnostics for center clipping ---
+            try:
+                if os.environ.get("PUM_LOG_C_DETAIL", "0").strip() not in ("", "0", "false", "False"):
+                    shrunk = []
+                    for li, s in enumerate(scales_layer or []):
+                        if s < 0.999:  # actually shrunk
+                            shrunk.append(li)
+                    if shrunk or (s_other is not None and s_other < 0.999):
+                        import statistics as _stats
+                        scales_used = [scales_layer[li] for li in shrunk] if shrunk else []
+                        if s_other is not None and not (scales_used):
+                            scales_used = [s_other]
+                        if scales_used:
+                            med = _stats.median(scales_used); mn = min(scales_used); mx = max(scales_used)
+                            logger.info("PUM center-clip: shrunk %d/%d layers; scale s_l median=%.3g, min=%.3g, max=%.3g",
+                                        len(shrunk), len(scales_layer or []), med, mn, mx)
+                        # Print a few worst layers (smallest scales)
+                        worst = sorted(shrunk, key=lambda i: scales_layer[i])[:8]
+                        for li in worst:
+                            nrm = math.sqrt(max(layer_sq[li], 1e-12))
+                            Cval = float(C_per_layer[li]) if (C_per_layer and li < len(C_per_layer)) else float('nan')
+                            logger.info("PUM center-clip detail: layer %d: ||q||_2=%.6g, C_l=%.6g, scale=%.3g",
+                                        li, nrm, Cval, scales_layer[li])
+                    else:
+                        logger.info("PUM center-clip: no layers shrunk this round.")
+            except Exception as _e:
+                logger.warning("PUM center-clip diagnostics failed: %s", str(_e))
         return delta
