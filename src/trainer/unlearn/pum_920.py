@@ -3,24 +3,21 @@
 # Deterministic seeds, tiny jitter, optional T (orthogonal + permute) reparam, center clipping with EMA ref.
 # Multi-GPU safe diffs under DeepSpeed/Accelerate (gather full, unsharded state before diff).
 #
-# NEW (bounded calibration & multi‑round fixes):
-#   • synth_mode="gaussian" (default): bounded synthetic public fallback uses per‑layer RMS, not L2.
-#         C_ℓ ≈ κ · ρ · RMS(θ_ref,ℓ)  (ρ≪1, default 0.02; θ_ref is the round‑(j−1) reference)
-#     This guarantees nonzero but not huge σ/C, avoiding the large values seen with function‑preserving transforms.
-#   • C_ℓ monotone non‑increasing across rounds (drift fix): on round j≥2, C_ℓ^{new} ← min(C_ℓ^{old}, C_ℓ^{obs}).
-#   • Relative caps/floors use per‑layer RMS(θ_ref,ℓ) (not global RMS, not L2).
-#   • σ safety clips (min/max) are computed against RMS(θ_ref), not the initial base model.
-#   • RDP λ grid broadened: [1.1,1.25,1.5,2,3,4,6,8,16,32,64,128,256].
-#   • Critical multi‑round change: wherever “θ_base,ℓ” was implicitly used to size C_ℓ,
-#     we now use the last‑round DP‑safe reference θ^{(j−1)}_ℓ (EMA of published means).
+# NEW (bounded calibration):
+#   • synth_mode="gaussian" (default): C_ℓ from small, bounded Gaussian dithers:
+#         C_ℓ ≈ κ · ρ · ||θ_ℓ||_2  (ρ≪1, default 0.02)
+#     This guarantees nonzero but not huge σ, avoiding the large values seen with function-preserving transforms.
+#   • C_ℓ relative clip/floor: PUM_C_REL_CLIP, PUM_C_REL_FLOOR.
+#   • σ min/max relative clips: PUM_SIGMA_MIN_REL, PUM_SIGMA_REL_CLIP (max existed; min added).
+#   • round-1 warmup: PUM_SIGMA_WARMUP_FACTOR (<1.0 makes initial noise small).
 #
 # Env toggles (can also be set via Hydra method_args):
 #   PUM_SYNTH_MODE            : "gaussian" | "function_preserving"    (default "gaussian")
 #   PUM_SYNTH_GAUSS_RHO       : float, default 0.02
-#   PUM_C_REL_CLIP            : float, optional (e.g., 0.05 → 5% of RMS(layer))
-#   PUM_C_REL_FLOOR           : float, optional (e.g., 0.005 → 0.5% of RMS(layer))
-#   PUM_SIGMA_MIN_REL         : float, default 0.0 (min σ ≥ this · RMS(θ_ref or base))
-#   PUM_SIGMA_REL_CLIP        : float, default 0.25 (max σ ≤ this · RMS(θ_ref or base))
+#   PUM_C_REL_CLIP            : float, optional (e.g., 0.05 → 5% of ||θ_ℓ||_2)
+#   PUM_C_REL_FLOOR           : float, optional (e.g., 0.005 → 0.5% of ||θ_ℓ||_2)
+#   PUM_SIGMA_MIN_REL         : float, default 0.0 (min σ ≥ this · RMS(θ_base))
+#   PUM_SIGMA_REL_CLIP        : float, default 0.25 (max σ ≤ this · RMS(θ_base))
 #   PUM_SIGMA_WARMUP_FACTOR   : float, default 1.0 (e.g., 0.2 on round 1)
 #
 # All other mechanics stay faithful to the methodology (per-layer RDP calibration, α‑scaling, zero‑sum noise, EMA, etc.)
@@ -233,11 +230,11 @@ class PUM(FinetuneTrainer):
 
         # NEW: bounded synthetic calibration & clamps
         synth_mode: str = "gaussian",           # "gaussian" | "function_preserving"
-        synth_gauss_rho: float = 0.02,          # C_ℓ ≈ κ·ρ·RMS(θ_ref,ℓ)
-        c_rel_clip: Optional[float] = None,     # cap C_ℓ ≤ c_rel_clip·RMS(θ_ref,ℓ)
-        c_rel_floor: Optional[float] = None,    # floor C_ℓ ≥ c_rel_floor·RMS(θ_ref,ℓ)
+        synth_gauss_rho: float = 0.02,          # C_ℓ ≈ κ·ρ·||θ_ℓ||_2
+        c_rel_clip: Optional[float] = None,     # cap C_ℓ ≤ c_rel_clip·||θ_ℓ||_2
+        c_rel_floor: Optional[float] = None,    # floor C_ℓ ≥ c_rel_floor·||θ_ℓ||_2
         sigma_warmup_factor: Optional[float] = None,
-        sigma_min_rel: float = 0.0,             # σ ≥ sigma_min_rel·RMS(θ_ref)
+        sigma_min_rel: float = 0.0,             # σ ≥ sigma_min_rel·RMS(θ_base)
 
         # base trainer args
         *args,
@@ -440,15 +437,18 @@ class PUM(FinetuneTrainer):
         else:
             self.server_center_clipping = _as_bool(server_center_clipping, default=False)
 
-        # Base & reference state dicts
-        self._theta_ref_sd: Dict[str, torch.Tensor] = self._state_dict_tensors(self.model)   # DP-safe ref (EMA of means)
+        # Base state & norms
+        self._theta_ref_sd: Dict[str, torch.Tensor] = self._state_dict_tensors(self.model)
         self._theta_base_sd: Dict[str, torch.Tensor] = {k: v.clone().detach().cpu() for k, v in self._theta_ref_sd.items()}
-        # Pre-compute base layer norms (for logging / fallback only)
-        self._layer_l2: Optional[List[float]] = self._compute_layer_l2_from_sd(self._theta_base_sd)
-        self._layer_rms: Optional[List[float]] = self._compute_layer_rms_from_sd(self._theta_base_sd)
+        self._layer_l2: Optional[List[float]] = self._compute_base_layer_l2()
+        self._layer_rms: Optional[List[float]] = self._compute_base_layer_rms()
 
-        # Global RMS (base)
-        self._base_global_rms = self._global_rms_from_sd(self._theta_base_sd)
+        denom = sum(v.numel() for v in self._theta_base_sd.values())
+        if denom <= 0:
+            self._base_global_rms = 0.0
+        else:
+            num = sum(v.detach().float().pow(2).sum().item() for v in self._theta_base_sd.values())
+            self._base_global_rms = math.sqrt(max(num / max(denom, 1), 0.0))
         self._pub_mean_prev_sd: Optional[Dict[str, torch.Tensor]] = None
         self._center_clip_C_from_quantile: Optional[List[float]] = None
 
@@ -464,26 +464,26 @@ class PUM(FinetuneTrainer):
     def _state_dict_tensors(self, model: nn.Module) -> Dict[str, torch.Tensor]:
         return {_canon_name(n): p.detach().clone().cpu() for (n, p) in _all_named_params(model)}
 
-    def _compute_layer_l2_from_sd(self, sd: Dict[str, torch.Tensor]) -> Optional[List[float]]:
+    def _compute_base_layer_l2(self) -> Optional[List[float]]:
         if not self._num_layers or self._num_layers <= 0:
             return None
         L = int(self._num_layers)
         out = [0.0 for _ in range(L)]
-        for name, v in sd.items():
+        for name, v in self._theta_base_sd.items():
             li = self._param_layer_index(name)
             if li is None or li >= L:
                 continue
             out[li] += v.detach().float().pow(2).sum().item()
         return [math.sqrt(max(x, 0.0)) for x in out]
 
-    def _compute_layer_rms_from_sd(self, sd: Dict[str, torch.Tensor]) -> Optional[List[float]]:
-        """Compute per-layer RMS(θ,ℓ) for an arbitrary state dict (θ may be θ_base or θ_ref of any round)."""
+    def _compute_base_layer_rms(self) -> Optional[List[float]]:
+        """Compute per-layer RMS(θ_base,ℓ)."""
         if not self._num_layers or self._num_layers <= 0:
             return None
         L = int(self._num_layers)
         sum_sq = [0.0 for _ in range(L)]
         counts = [0 for _ in range(L)]
-        for name, v in sd.items():
+        for name, v in self._theta_base_sd.items():
             li = self._param_layer_index(name)
             if li is None or li >= L:
                 continue
@@ -495,13 +495,6 @@ class PUM(FinetuneTrainer):
             c = max(counts[li], 1)
             rms.append(math.sqrt(max(sum_sq[li] / float(c), 0.0)))
         return rms
-
-    def _global_rms_from_sd(self, sd: Dict[str, torch.Tensor]) -> float:
-        denom = sum(v.numel() for v in sd.values())
-        if denom <= 0:
-            return 0.0
-        num = sum(v.detach().float().pow(2).sum().item() for v in sd.values())
-        return math.sqrt(max(num / max(denom, 1), 0.0))
 
     @staticmethod
     def _accelerate_get_full_state_dict(trainer_like) -> Optional[Dict[str, torch.Tensor]]:
@@ -577,10 +570,9 @@ class PUM(FinetuneTrainer):
 
     def _orders_grid(self) -> List[float]:
         if not self.dp_rdp_orders:
-            # Broadened grid: small λ near 1 tighten δ term; larger λ helpful when Δ small.
-            return [1.1, 1.25, 1.5, 2, 3, 4, 6, 8, 16, 32, 64, 128, 256]
+            return [1.5, 2, 3, 4, 8, 16, 32, 64, 128]
         orders = [float(x) for x in self.dp_rdp_orders if float(x) > 1.0]
-        return orders or [1.5, 2.0, 4.0, 8.0, 16.0]
+        return orders or [2.0, 4.0, 8.0, 16.0]
 
     @staticmethod
     def _param_layer_index(param_name: str) -> Optional[int]:
@@ -621,16 +613,15 @@ class PUM(FinetuneTrainer):
 
     
     def _apply_sigma_safety_clip(self) -> None:
-        # Clip σ by relative RMS; per-layer if available — use the CURRENT round reference θ_ref.
+        # Clip σ by relative RMS; per-layer if available
         try:
             sigma_rel_clip = float(os.environ.get("PUM_SIGMA_REL_CLIP", "0.25"))
         except (TypeError, ValueError):
             sigma_rel_clip = 0.25
         sigma_rel_clip = max(sigma_rel_clip, 0.0)
 
-        # Use current reference stats, fall back to base
-        cur_rms_global = self._global_rms_from_sd(self._theta_ref_sd) if hasattr(self, "_theta_ref_sd") else self._base_global_rms
-        layer_rms_list = self._compute_layer_rms_from_sd(self._theta_ref_sd) if hasattr(self, "_theta_ref_sd") else self._layer_rms
+        base_rms = max(getattr(self, "_base_global_rms", 0.0), 0.0)
+        layer_rms_list = getattr(self, "_layer_rms", None)
 
         # Max-relative clip
         if sigma_rel_clip > 0.0:
@@ -646,15 +637,15 @@ class PUM(FinetuneTrainer):
                     new_vals.append(s_val)
                 self.sigma_per_layer = new_vals
                 if clamped:
-                    logger.info("PUM: per-layer σ clipped by rel %.3g to layer RMS (current ref).", sigma_rel_clip)
-            elif self.sigma_per_layer is not None and cur_rms_global > 0.0:
-                limit = sigma_rel_clip * max(cur_rms_global, 1e-8)
+                    logger.info("PUM: per-layer σ clipped by rel %.3g to layer RMS.", sigma_rel_clip)
+            elif self.sigma_per_layer is not None and base_rms > 0.0:
+                limit = sigma_rel_clip * max(base_rms, 1e-8)
                 self.sigma_per_layer = [min(max(float(s or 0.0), 0.0), limit) for s in self.sigma_per_layer]
-                logger.info("PUM: per-layer σ clipped to <= %.6g based on global RMS (current ref).", limit)
-            elif cur_rms_global > 0.0:
-                limit = sigma_rel_clip * max(cur_rms_global, 1e-8)
+                logger.info("PUM: per-layer σ clipped to <= %.6g based on global RMS.", limit)
+            elif base_rms > 0.0:
+                limit = sigma_rel_clip * max(base_rms, 1e-8)
                 self.sigma = min(max(float(self.sigma or 0.0), 0.0), limit)
-                logger.info("PUM: σ clipped to <= %.6g (rel clip=%.3g, ref_rms=%.6g)", limit, sigma_rel_clip, cur_rms_global)
+                logger.info("PUM: σ clipped to <= %.6g (rel clip=%.3g, base_rms=%.6g)", limit, sigma_rel_clip, base_rms)
 
         # Min-relative floor
         min_rel = float(getattr(self, "sigma_min_rel", 0.0) or 0.0)
@@ -671,9 +662,9 @@ class PUM(FinetuneTrainer):
                     new_vals.append(s_val)
                 self.sigma_per_layer = new_vals
                 if floored:
-                    logger.info("PUM: per-layer σ floored by rel %.3g to layer RMS (current ref).", min_rel)
-            elif self.sigma_per_layer is not None and cur_rms_global > 0.0:
-                floor = min_rel * cur_rms_global
+                    logger.info("PUM: per-layer σ floored by rel %.3g to layer RMS.", min_rel)
+            elif self.sigma_per_layer is not None and base_rms > 0.0:
+                floor = min_rel * base_rms
                 new_vals = []
                 floored = False
                 for s in self.sigma_per_layer:
@@ -684,13 +675,13 @@ class PUM(FinetuneTrainer):
                     new_vals.append(s_val)
                 self.sigma_per_layer = new_vals
                 if floored:
-                    logger.info("PUM: per-layer σ floored to >= %.6g based on global RMS (current ref).", floor)
-            elif cur_rms_global > 0.0:
-                floor = min_rel * cur_rms_global
+                    logger.info("PUM: per-layer σ floored to >= %.6g based on global RMS.", floor)
+            elif base_rms > 0.0:
+                floor = min_rel * base_rms
                 s_val = float(self.sigma or 0.0)
                 if s_val < floor:
                     self.sigma = floor
-                logger.info("PUM: σ floored to >= %.6g (min rel=%.3g, ref_rms=%.6g)", floor, min_rel, cur_rms_global)
+                logger.info("PUM: σ floored to >= %.6g (min rel=%.3g, base_rms=%.6g)", floor, min_rel, base_rms)
 
 
     def _calibrate_sigma_from_dp(self) -> None:
@@ -780,7 +771,7 @@ class PUM(FinetuneTrainer):
         C_per_layer: Optional[List[float]] = None
         C_global: Optional[float] = None
         if self._center_clip_C_from_quantile is not None:
-            # Avoid multiplicative drift of C_ℓ across rounds: hold the cached thresholds.
+            # Avoid multiplicative drift of C_ℓ across rounds
             C_per_layer = [float(c) for c in self._center_clip_C_from_quantile]
             return C_per_layer, None
         if self.center_clip_C_per_layer is not None and len(self.center_clip_C_per_layer) > 0:
@@ -1329,42 +1320,29 @@ class PUM(FinetuneTrainer):
             m_float = float(self.copies_m)
             self._pub_mean_prev_sd = {n: (pub_sum_server[n] / m_float).detach().clone() for n in pub_sum_server}
 
-            # update C_ℓ from observed norms (drift‑safe, monotone non‑increasing)
+            # update C_ℓ from observed norms (optional)
             if round_norms_per_layer is not None:
                 q = min(max(self.center_clip_quantile_q, 0.0), 1.0)
                 kappa = max(self.center_clip_quantile_kappa, 0.0)
-                Cs_obs: List[float] = []
+                gamma = 1.0  # disable multiplicative growth across rounds
+                Cs: List[float] = []
                 for li in range(len(round_norms_per_layer)):
                     vals = round_norms_per_layer[li]
                     if not vals:
-                        Cs_obs.append(0.0)
+                        Cs.append(0.0)
                     else:
                         t = torch.tensor(vals, dtype=torch.float32)
                         c_l = float(torch.quantile(t, q).item()) * kappa
-                        Cs_obs.append(c_l)
-                # Apply relative clip/floor w.r.t current θ_ref RMS
-                rms_ref = self._compute_layer_rms_from_sd(self._theta_ref_sd)
-                if rms_ref is not None:
-                    for li in range(len(Cs_obs)):
-                        R_i = float(rms_ref[li]) if li < len(rms_ref) else 0.0
-                        if self.c_rel_clip is not None and self.c_rel_clip > 0 and R_i > 0:
-                            Cs_obs[li] = min(Cs_obs[li], self.c_rel_clip * R_i)
-                        if self.c_rel_floor is not None and self.c_rel_floor > 0 and R_i > 0:
-                            Cs_obs[li] = max(Cs_obs[li], self.c_rel_floor * R_i)
-                # Monotone non‑increasing across rounds
-                if self._center_clip_C_from_quantile is None:
-                    self._center_clip_C_from_quantile = Cs_obs
-                else:
-                    prev = self._center_clip_C_from_quantile
-                    L = min(len(prev), len(Cs_obs))
-                    self._center_clip_C_from_quantile = [min(prev[i], Cs_obs[i]) for i in range(L)]
-                    # keep tail if any
-                    if len(prev) > L:
-                        self._center_clip_C_from_quantile += prev[L:]
-                    elif len(Cs_obs) > L:
-                        self._center_clip_C_from_quantile += Cs_obs[L:]
-                if len(self._center_clip_C_from_quantile) >= 3:
-                    logger.info("PUM: updated (monotone) C_l [0:3]=%s ...", str(self._center_clip_C_from_quantile[:3]))
+                        Cs.append(c_l)
+                # apply relative clip/floor if requested
+                if self._layer_l2 is not None:
+                    for li in range(len(Cs)):
+                        L2 = float(self._layer_rms[li]) if (self._layer_rms is not None and li < len(self._layer_rms)) else 0.0
+                        if self.c_rel_clip is not None and self.c_rel_clip > 0 and L2 > 0:
+                            Cs[li] = min(Cs[li], self.c_rel_clip * L2)
+                        if self.c_rel_floor is not None and self.c_rel_floor > 0 and L2 > 0:
+                            Cs[li] = max(Cs[li], self.c_rel_floor * L2)
+                self._center_clip_C_from_quantile = Cs
 
         self.model.eval()
         acc = getattr(self, "accelerator", None)
@@ -1390,7 +1368,7 @@ class PUM(FinetuneTrainer):
         norms_per_layer: List[List[float]] = [[] for _ in range(L)]
 
         def accumulate_from_state_dict(sd: Dict[str, torch.Tensor]):
-            for name, base_v in self._theta_ref_sd.items():  # CRITICAL FIX: anchor at θ_ref (θ^{(j−1)}), not θ_base
+            for name, base_v in self._theta_ref_sd.items():
                 li = self._param_layer_index(name)
                 if li is None or li >= L:
                     continue
@@ -1412,7 +1390,7 @@ class PUM(FinetuneTrainer):
                         except Exception:
                             ref_model = None
                     if ref_model is not None:
-                        ref_sd = { _canon_name(k): v.detach().cpu() for (k, v) in ref_model.named_parameters() }
+                        ref_sd = {k: v.detach().cpu() for (k, v) in ref_model.named_parameters()}
                         accumulate_from_state_dict(ref_sd)
                         del ref_model
                         torch.cuda.empty_cache()
@@ -1434,7 +1412,7 @@ class PUM(FinetuneTrainer):
                                     sd = torch.load(fp, map_location="cpu")
                                 if isinstance(sd, dict) and "state_dict" in sd and isinstance(sd["state_dict"], dict):
                                     sd = sd["state_dict"]
-                                ref_sd = { _canon_name(k): v for k, v in sd.items() if isinstance(v, torch.Tensor) }
+                                ref_sd = {k: v for k, v in sd.items() if isinstance(v, torch.Tensor)}
                                 accumulate_from_state_dict(ref_sd)
                                 loaded = True
                                 break
@@ -1448,23 +1426,23 @@ class PUM(FinetuneTrainer):
         # (B) synthetic public fallback
         if all(len(v) == 0 for v in norms_per_layer) and self.center_clip_ref_synth_J > 0:
             if (self.synth_mode or "gaussian") == "gaussian":
-                # BOUNDED: C_ℓ ≈ κ · ρ · RMS(θ_ref,ℓ) per synthetic sample; quantile ⇒ same scale.
+                # BOUNDED: C_ℓ ≈ κ · ρ · ||θ_ℓ||_2 per synthetic sample; quantile ⇒ same scale.
                 rho = max(float(self.synth_gauss_rho), 0.0)
-                layer_rms_ref = self._compute_layer_rms_from_sd(self._theta_ref_sd)  # CURRENT REF, not base
-                if layer_rms_ref is None:
+                layer_rms = getattr(self, "_layer_rms", None)
+                if layer_rms is None:
                     logger.warning("PUM: layer RMS unavailable; gaussian synth fallback cannot scale per layer.")
                 J = int(self.center_clip_ref_synth_J)
                 for j in range(J):
                     for li in range(L):
-                        rms_i = float(layer_rms_ref[li]) if (layer_rms_ref is not None and li < len(layer_rms_ref)) else 0.0
-                        norms_per_layer[li].append(rho * rms_i)
+                        base_rms_i = float(layer_rms[li]) if (layer_rms is not None and li < len(layer_rms)) else 0.0
+                        norms_per_layer[li].append(rho * base_rms_i)
                 logger.info("PUM: synthetic public refs used for C_l (mode=gaussian, rho=%.4g, J=%d).", rho, J)
             else:
                 # function-preserving (old) — can be large; keep for completeness
                 J = int(self.center_clip_ref_synth_J)
                 for j in range(J):
                     tmp = copy.deepcopy(self.model)
-                    self._materialize_params(tmp, self._theta_ref_sd)  # anchor at θ_ref (not base)
+                    self._materialize_params(tmp, self._theta_base_sd)
                     Tj = self._sample_T(tmp, seed=self._base_seed + 13 * (j + 1), force=True)
                     if Tj is None:
                         continue
@@ -1488,19 +1466,18 @@ class PUM(FinetuneTrainer):
                 c_l = float(torch.quantile(t, q).item()) * kappa
                 Cs.append(c_l)
 
-        # apply user caps/floors relative to RMS(θ_ref,ℓ)
-        layer_rms_ref = self._compute_layer_rms_from_sd(self._theta_ref_sd)
-        if layer_rms_ref is not None:
+        # apply user caps/floors relative to ||θ_ℓ||_2
+        if self._layer_l2 is not None:
             for li in range(L):
-                R_i = float(layer_rms_ref[li]) if li < len(layer_rms_ref) else 0.0
-                if self.c_rel_clip is not None and self.c_rel_clip > 0 and R_i > 0:
-                    Cs[li] = min(Cs[li], self.c_rel_clip * R_i)
-                if self.c_rel_floor is not None and self.c_rel_floor > 0 and R_i > 0:
-                    Cs[li] = max(Cs[li], self.c_rel_floor * R_i)
+                L2 = float(self._layer_rms[li]) if (self._layer_rms is not None and li < len(self._layer_rms)) else 0.0
+                if self.c_rel_clip is not None and self.c_rel_clip > 0 and L2 > 0:
+                    Cs[li] = min(Cs[li], self.c_rel_clip * L2)
+                if self.c_rel_floor is not None and self.c_rel_floor > 0 and L2 > 0:
+                    Cs[li] = max(Cs[li], self.c_rel_floor * L2)
 
         self._center_clip_C_from_quantile = Cs
         if len(Cs) >= 3:
-            logger.info("PUM: C_l preview [0:3]=%s ... (q=%.2f, κ=%.2f; anchored at θ_ref)", str(Cs[:3]), q, kappa)
+            logger.info("PUM: C_l preview [0:3]=%s ... (q=%.2f, κ=%.2f)", str(Cs[:3]), q, kappa)
 
     def _compute_center_clip_delta(
         self,
