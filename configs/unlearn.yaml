@@ -9,9 +9,19 @@ defaults:
   - experiment: null
   - _self_
 
-trainer:
-  args: 
-    remove_unused_columns: False
+# <-- NEW: expose a root-level 'mode' so hydra.run.dir can interpolate it
+mode: ${trainer.mode}
 
-mode: unlearn
-task_name: ???
+trainer:
+  args:
+    remove_unused_columns: False
+  mode: unlearn
+  task_name: ???
+
+  # ---- Epoch-wise reparameterization (OFF by default) ----
+  reparam:
+    enable: false           # set true (or override from CLI) to turn on
+    ops: [attn, mlp]
+    seed_offset: 0
+    reset_optimizer_each_epoch: false
+    set_epoch_on_dataset: true

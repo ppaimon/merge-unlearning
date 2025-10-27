@@ -1,6 +1,6 @@
 import torch
-from typing import Dict, Any
-from omegaconf import DictConfig
+from typing import Dict, Any, Optional, Tuple
+from omegaconf import DictConfig, OmegaConf
 from transformers import Trainer, TrainingArguments
 
 from trainer.base import FinetuneTrainer
@@ -17,16 +17,16 @@ from trainer.unlearn.wga import WGA
 from trainer.unlearn.pdu import PDU
 from trainer.unlearn.pum import PUM
 
-import logging
+# NEW: epoch-wise reparameterization callback
+from trainer.unlearn.reparam_epochwise import EpochwiseReparamCallback
 
+import logging
 logger = logging.getLogger(__name__)
 
 TRAINER_REGISTRY: Dict[str, Any] = {}
 
-
 def _register_trainer(trainer_class):
     TRAINER_REGISTRY[trainer_class.__name__] = trainer_class
-
 
 def load_trainer_args(trainer_args: DictConfig, dataset):
     trainer_args = dict(trainer_args)
@@ -37,13 +37,10 @@ def load_trainer_args(trainer_args: DictConfig, dataset):
         num_devices = torch.cuda.device_count()
         dataset_len = len(dataset)
         trainer_args["warmup_steps"] = int(
-            (warmup_epochs * dataset_len)
-            // (batch_size * grad_accum_steps * num_devices)
+            (warmup_epochs * dataset_len) // (batch_size * grad_accum_steps * num_devices)
         )
-
     trainer_args = TrainingArguments(**trainer_args)
     return trainer_args
-
 
 def load_trainer(
     trainer_cfg: DictConfig,
@@ -59,13 +56,10 @@ def load_trainer(
     method_args = trainer_cfg.get("method_args", {})
     trainer_args = load_trainer_args(trainer_args, train_dataset)
     trainer_handler_name = trainer_cfg.get("handler")
-    assert trainer_handler_name is not None, ValueError(
-        f"{trainer_handler_name} handler not set"
-    )
+    assert trainer_handler_name is not None, ValueError(f"{trainer_handler_name} handler not set")
     trainer_cls = TRAINER_REGISTRY.get(trainer_handler_name, None)
-    assert trainer_cls is not None, NotImplementedError(
-        f"{trainer_handler_name} not implemented or not registered"
-    )
+    assert trainer_cls is not None, NotImplementedError(f"{trainer_handler_name} not implemented or not registered")
+
     trainer = trainer_cls(
         model=model,
         train_dataset=train_dataset,
@@ -77,11 +71,25 @@ def load_trainer(
         template_args=template_args,
         **method_args,
     )
-    logger.info(
-        f"{trainer_handler_name} Trainer loaded, output_dir: {trainer_args.output_dir}"
-    )
-    return trainer, trainer_args
+    logger.info(f"{trainer_handler_name} Trainer loaded, output_dir: {trainer_args.output_dir}")
 
+    # -------- NEW: optionally register epoch-wise reparam callback ----------
+    reparam_cfg = trainer_cfg.get("reparam", None)
+    if reparam_cfg is not None and reparam_cfg.get("enable", False):
+        cb = EpochwiseReparamCallback(
+            ops=tuple(reparam_cfg.get("ops", ["attn", "mlp"])),
+            seed_offset=int(reparam_cfg.get("seed_offset", 0)),
+            reset_optimizer_each_epoch=bool(reparam_cfg.get("reset_optimizer_each_epoch", False)),
+            set_epoch_on_dataset=bool(reparam_cfg.get("set_epoch_on_dataset", True)),
+        )
+        try:
+            trainer.add_callback(cb)
+            logger.info("EpochwiseReparamCallback registered.")
+        except Exception as e:
+            logger.warning(f"Failed to register EpochwiseReparamCallback: {e}")
+    # -----------------------------------------------------------------------
+
+    return trainer, trainer_args
 
 # Register Finetuning Trainer
 _register_trainer(Trainer)
