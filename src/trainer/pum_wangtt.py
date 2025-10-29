@@ -355,3 +355,17 @@ class PUMTrainer:
         base_sd.update(new_sd)
         self.model.load_state_dict(base_sd)
         return new_sd, bar_delta
+
+
+
+"""
+
+sample run
+
+# fresh env, per README (nvcc + flash-attn as needed)
+conda activate unlearning
+pip install -e ".[lm_eval]"
+python setup_data.py --eval
+
+# then:
+bash scripts/pum_unlearn.sh"""

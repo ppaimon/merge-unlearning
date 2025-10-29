@@ -1,0 +1,26 @@
+# configs/trainer/PUM_LD.yaml
+name: PUM_LD
+
+# Method-specific config consumed by src/trainer/unlearn/pum.py
+pum_cfg:
+  m: 6
+  alpha: [1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+  sigma_mode: rms_kappa   # or: fixed
+  sigma_fixed: 0.05       # used only if sigma_mode==fixed
+  kappa: 0.10             # used only if sigma_mode==rms_kappa
+  eta_srv: 1.0
+  seed_noise: 17
+  seed_reparam: 23
+  reparam_attention_rotate: true
+  reparam_ffn_pair_permute: true
+  reparam_residual_permute: false
+  attn_num_heads: null
+  verbose: true
+
+# HF Trainer-like args that your scripts override from CLI.
+# Keeping these here means trainer.args.* overrides in shell still work.
+args:
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 4
+  ddp_find_unused_parameters: true
+  gradient_checkpointing: true
