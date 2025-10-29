@@ -189,19 +189,18 @@ for split in "${SPLITS[@]}"; do
           trainer.args.gradient_accumulation_steps="${gradient_accumulation_steps}" \
           trainer.args.ddp_find_unused_parameters=true \
           trainer.args.gradient_checkpointing=true \
-          +trainer.pum_cfg.m="${PUM_M}" \
-          +trainer.pum_cfg.alpha="${PUM_ALPHA}" \
-          +trainer.pum_cfg.sigma_mode="${PUM_SIGMA_MODE}" \
-          +trainer.pum_cfg.kappa="${PUM_KAPPA}" \
-          +trainer.pum_cfg.sigma_fixed="${PUM_SIGMA_FIXED}" \
-          +trainer.pum_cfg.eta_srv="${PUM_ETA_SRV}" \
-          +trainer.pum_cfg.seed_noise="${PUM_SEED_NOISE}" \
-          +trainer.pum_cfg.seed_reparam="${PUM_SEED_REPARAM}" \
-          +trainer.pum_cfg.reparam_attention_rotate="${PUM_ROTATE}" \
-          +trainer.pum_cfg.reparam_ffn_pair_permute="${PUM_PERMUTE}" \
-          +trainer.pum_cfg.reparam_residual_permute="${PUM_RES_PERMUTE}"
-          # 如你的 DPO 代码需显式指定 idk 路径，可解注下一行
-          # data.idk_path="${IDK_PATH}"
+          trainer.pum_cfg.m="${PUM_M}" \
+          trainer.pum_cfg.alpha=${PUM_ALPHA} \
+          trainer.pum_cfg.sigma_mode="${PUM_SIGMA_MODE}" \
+          trainer.pum_cfg.kappa="${PUM_KAPPA}" \
+          trainer.pum_cfg.sigma_fixed="${PUM_SIGMA_FIXED}" \
+          trainer.pum_cfg.eta_srv="${PUM_ETA_SRV}" \
+          trainer.pum_cfg.seed_noise="${PUM_SEED_NOISE}" \
+          trainer.pum_cfg.seed_reparam="${PUM_SEED_REPARAM}" \
+          trainer.pum_cfg.reparam_attention_rotate="${PUM_ROTATE}" \
+          trainer.pum_cfg.reparam_ffn_pair_permute="${PUM_PERMUTE}" \
+          trainer.pum_cfg.reparam_residual_permute="${PUM_RES_PERMUTE}"
+
       fi
 
       ########################
@@ -292,17 +291,18 @@ PY
             trainer.args.ddp_find_unused_parameters=true \
             trainer.args.gradient_checkpointing=true \
             trainer.args.resume_from_checkpoint=last \
-            +trainer.pum_cfg.m="${PUM_M}" \
-            +trainer.pum_cfg.alpha="${PUM_ALPHA}" \
-            +trainer.pum_cfg.sigma_mode="${PUM_SIGMA_MODE}" \
-            +trainer.pum_cfg.kappa="${PUM_KAPPA}" \
-            +trainer.pum_cfg.sigma_fixed="${PUM_SIGMA_FIXED}" \
-            +trainer.pum_cfg.eta_srv="${PUM_ETA_SRV}" \
-            +trainer.pum_cfg.seed_noise="${PUM_SEED_NOISE}" \
-            +trainer.pum_cfg.seed_reparam="${PUM_SEED_REPARAM}" \
-            +trainer.pum_cfg.reparam_attention_rotate="${PUM_ROTATE}" \
-            +trainer.pum_cfg.reparam_ffn_pair_permute="${PUM_PERMUTE}" \
-            +trainer.pum_cfg.reparam_residual_permute="${PUM_RES_PERMUTE}"
+            trainer.pum_cfg.m="${PUM_M}" \
+            trainer.pum_cfg.alpha=${PUM_ALPHA} \
+            trainer.pum_cfg.sigma_mode="${PUM_SIGMA_MODE}" \
+            trainer.pum_cfg.kappa="${PUM_KAPPA}" \
+            trainer.pum_cfg.sigma_fixed="${PUM_SIGMA_FIXED}" \
+            trainer.pum_cfg.eta_srv="${PUM_ETA_SRV}" \
+            trainer.pum_cfg.seed_noise="${PUM_SEED_NOISE}" \
+            trainer.pum_cfg.seed_reparam="${PUM_SEED_REPARAM}" \
+            trainer.pum_cfg.reparam_attention_rotate="${PUM_ROTATE}" \
+            trainer.pum_cfg.reparam_ffn_pair_permute="${PUM_PERMUTE}" \
+            trainer.pum_cfg.reparam_residual_permute="${PUM_RES_PERMUTE}"
+
 
           python "$EVAL_PY" \
             experiment=eval/tofu/default.yaml \

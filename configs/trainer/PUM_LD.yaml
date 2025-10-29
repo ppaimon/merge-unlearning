@@ -1,13 +1,13 @@
 # configs/trainer/PUM_LD.yaml
 name: PUM_LD
+handler: PUM_LD     # <-- this is what load_trainer(..) uses
 
-# Method-specific config consumed by src/trainer/unlearn/pum.py
-pum_cfg:
+pum_cfg:            # forwarded to the handler as method_args.pum_cfg (via load_trainer)
   m: 6
   alpha: [1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
-  sigma_mode: rms_kappa   # or: fixed
-  sigma_fixed: 0.05       # used only if sigma_mode==fixed
-  kappa: 0.10             # used only if sigma_mode==rms_kappa
+  sigma_mode: rms_kappa
+  sigma_fixed: 0.05
+  kappa: 0.10
   eta_srv: 1.0
   seed_noise: 17
   seed_reparam: 23
@@ -17,8 +17,12 @@ pum_cfg:
   attn_num_heads: null
   verbose: true
 
-# HF Trainer-like args that your scripts override from CLI.
-# Keeping these here means trainer.args.* overrides in shell still work.
+# Optional: local client steps & lr
+method_args:
+  local_steps: 10
+  local_lr: 1e-4
+
+# HF Trainer args (your script overrides these as usual)
 args:
   per_device_train_batch_size: 2
   gradient_accumulation_steps: 4

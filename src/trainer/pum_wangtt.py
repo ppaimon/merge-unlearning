@@ -44,21 +44,21 @@ def tree_copy_into_(dst: MutableMapping[str, torch.Tensor], src: Mapping[str, to
 @dataclass
 class PUMConfig:
     # number of copies
-    m: int = 6
+    m: int
     # α scaling per copy (must match m)
-    alpha: List[float] = field(default_factory=lambda: [1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    alpha: List[float]
 
     # σ strategy: fixed scalar or per-layer RMS * κ
     sigma_mode: str = "rms_kappa"   # {"fixed", "rms_kappa"}
-    sigma_fixed: float = 0.05
-    kappa: float = 0.10
+    sigma_fixed: float
+    kappa: float
 
     # server step size on aggregated delta
     eta_srv: float = 1.0
 
     # deterministic seeds
-    seed_noise: int = 17
-    seed_reparam: int = 23
+    seed_noise: int = 0
+    seed_reparam: int = 1
 
     # Reparam toggles
     reparam_attention_rotate: bool = True
@@ -143,6 +143,7 @@ def generate_ld_noise_by_copy(
 
     return eps_by_copy
 
+##-----OK checked
 
 # -----------------------------
 # Reparameterization planner (HF Llama-style keys with robust fallbacks)
@@ -179,6 +180,7 @@ class ReparamPlan:
             found_ffn = (gate in sd and up in sd and down in sd)
             if found_attn:
                 self.attn_blocks.append({"q": qk, "k": kk, "v": vk, "o": ok})
+
             if found_ffn:
                 self.ffn_blocks.append({"gate": gate, "up": up, "down": down})
 
@@ -187,6 +189,7 @@ class ReparamPlan:
                     break
             i += 1
 
+#-----prompt: may add check warning if nothing is found
         # head hints
         self.hidden_size = None
         self.num_heads = cfg.attn_num_heads
