@@ -17,21 +17,29 @@ logger = logging.getLogger(__name__)
 # -----------------------------
 # Small tree utilities over state_dict
 # -----------------------------
+
+
+# clone one mapping into Dict
 def tree_like(x: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     return {k: v.clone() for k, v in x.items()}
 
+# Build dict with zero valued (Tensor) Dict
 def tree_zeros_like(x: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     return {k: torch.zeros_like(v) for k, v in x.items()}
 
+# add the values with same key, return Dict
 def tree_add(a: Mapping[str, torch.Tensor], b: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    return {k: a[k] + b[k] for k in a.keys() if k in b}
+    return {k: a[k].to('cpu') + b[k].to('cpu') for k in a.keys() if k in b}
 
+# subtract values with same key, return Dict
 def tree_sub(a: Mapping[str, torch.Tensor], b: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    return {k: a[k] - b[k] for k in a.keys() if k in b}
+    return {k: a[k].to('cpu') - b[k].to('cpu') for k in a.keys() if k in b}
 
+# Multiply the values with scaling s
 def tree_scale(a: Mapping[str, torch.Tensor], s: float) -> Dict[str, torch.Tensor]:
     return {k: v * s for k, v in a.items()}
 
+# copy common items from second var to the first
 def tree_copy_into_(dst: MutableMapping[str, torch.Tensor], src: Mapping[str, torch.Tensor]) -> None:
     for k, v in src.items():
         if k in dst:
@@ -41,6 +49,8 @@ def tree_copy_into_(dst: MutableMapping[str, torch.Tensor], src: Mapping[str, to
 # -----------------------------
 # Config
 # -----------------------------
+
+# only for save hyoeroarams, no functions in the method
 @dataclass
 class PUMConfig:
     # number of copies
@@ -49,16 +59,17 @@ class PUMConfig:
     alpha: List[float]
 
     # σ strategy: fixed scalar or per-layer RMS * κ
-    sigma_mode: str = "rms_kappa"   # {"fixed", "rms_kappa"}
-    sigma_fixed: float
+    sigma_mode: str # = "rms_kappa"   # {"fixed", "rms_kappa"}
+    sigma_fixed: float = 0.0
     kappa: float
 
     # server step size on aggregated delta
     eta_srv: float = 1.0
 
     # deterministic seeds
-    seed_noise: int = 0
-    seed_reparam: int = 1
+    seed_noise: int
+    seed_reparam: int
+    seed_train: int
 
     # Reparam toggles
     reparam_attention_rotate: bool = True
@@ -81,8 +92,8 @@ def _seed_from(scope_seed: int, *chunks: str) -> int:
         h.update(c.encode("utf-8"))
     return int.from_bytes(h.digest()[:8], "little")
 
-def _torch_gen(seed: int) -> torch.Generator:
-    g = torch.Generator()
+def _torch_gen(seed: int, device) -> torch.Generator:
+    g = torch.Generator(device=device)
     g.manual_seed(seed)
     return g
 
@@ -108,6 +119,7 @@ def compute_sigma_by_layer(params: Mapping[str, torch.Tensor], cfg: PUMConfig) -
 
 # -----------------------------
 # Noise: ε_k,ℓ = α_k ε^0_k,ℓ  (linearly dependent; not zero-sum after scaling)
+# return eps_by_copy[k][name] , each is a noise tensor, with k be the copy index and name be the layername
 # -----------------------------
 def generate_ld_noise_by_copy(
     params: Mapping[str, torch.Tensor],
@@ -130,16 +142,16 @@ def generate_ld_noise_by_copy(
 
     for name, w in params.items():
         sigma = sigmas[name]
-        gen_key = _torch_gen(_seed_from(cfg.seed_noise, f"noise::{name}"))
+        gen_key = _torch_gen(_seed_from(cfg.seed_noise, f"noise::{name}"), device="cpu")
         # z_k ~ N(0, σ^2 I)
-        zs = [torch.normal(0.0, sigma, size=w.shape, generator=gen_key, device=w.device, dtype=w.dtype) for _ in range(m)]
+        zs = [torch.normal(0.0, sigma, size=w.shape, generator=gen_key, device="cpu", dtype=w.dtype) for _ in range(m)]
         z_bar = sum(zs) / m
         scale = math.sqrt(m / (m - 1.0))
         for k in range(m):
             eps0_by_key[name][k] = scale * (zs[k] - z_bar)
         # publish ε_k = α_k ε^0_k
         for k in range(m):
-            eps_by_copy[k][name] = cfg.alpha[k] * eps0_by_key[name][k]
+            eps_by_copy[k][name] = cfg.alpha[k] * eps0_by_key[name][k].to("cpu")
 
     return eps_by_copy
 
@@ -161,7 +173,11 @@ class ReparamPlan:
         self.cfg = cfg
         self.model = model
         sd = model.state_dict()
+
+        # The k-th entry be a Dict with the k-th atten layer param names
+        # e.g. self.attn_blocks[k][q] = f"model.layers.{k}.self_attn.q_proj.weight"
         self.attn_blocks: List[Dict[str, str]] = []
+        # The k-th entry be a Dict with the k-th ffn layer params names
         self.ffn_blocks: List[Dict[str, str]] = []
 
         # Discover layer blocks by common HF Llama naming
@@ -184,12 +200,16 @@ class ReparamPlan:
             if found_ffn:
                 self.ffn_blocks.append({"gate": gate, "up": up, "down": down})
 
-            if not found_attn and not found_ffn:
+            if (not found_attn) and (not found_ffn):
                 if i > 0:  # stop after first miss following at least one hit
                     break
+                else:
+                    raise ValueError("no layer is found for model") # raise warning if no 
             i += 1
 
-#-----prompt: may add check warning if nothing is found
+
+#-----------Check: may wrap this "find param names" part into a function for later calling
+
         # head hints
         self.hidden_size = None
         self.num_heads = cfg.attn_num_heads
@@ -211,18 +231,19 @@ class ReparamPlan:
                 str(self.hidden_size), str(self.num_heads)
             )
 
-    def _sample_head_rotation(self, gen: torch.Generator, device, dtype) -> torch.Tensor | None:
+    def _sample_head_rotation(self, gen: torch.Generator, device, dtype, wq: torch.Tensor) -> torch.Tensor | None:
         if self.hidden_size is None or self.num_heads is None or self.hidden_size % self.num_heads != 0:
             return None
-        head_dim = self.hidden_size // self.num_heads
+        hidden_size_out, hidden_size_in = wq.shape
+        head_dim = hidden_size_out // self.num_heads
         blocks = []
         for _ in range(self.num_heads):
-            A = torch.randn((head_dim, head_dim), generator=gen, device=device, dtype=dtype)
+            A = torch.randn((head_dim, head_dim), generator=gen, device=device, dtype=torch.float32)
             Q, _ = torch.linalg.qr(A, mode="reduced")
             # proper rotation
             if torch.det(Q) < 0:
                 Q[:, 0] = -Q[:, 0]
-            blocks.append(Q)
+            blocks.append(Q.to(dtype=dtype))
         R = torch.block_diag(*blocks)
         return R
 
@@ -231,24 +252,24 @@ class ReparamPlan:
             return
         Rt = R.t()
         for blk in self.attn_blocks:
-            WQ = sd[blk["q"]]; WK = sd[blk["k"]]; WV = sd[blk["v"]]; WO = sd[blk["o"]]
+            WQ = sd[blk["q"]].to('cpu'); WK = sd[blk["k"]].to('cpu'); WV = sd[blk["v"]].to('cpu'); WO = sd[blk["o"]].to('cpu')
             if not inverse:
-                sd[blk["q"]] = (R @ WQ)
-                sd[blk["k"]] = (R @ WK)
-                sd[blk["v"]] = (R @ WV)
-                sd[blk["o"]] = (WO @ Rt)
+                sd[blk["q"]] = WQ @ Rt
+                sd[blk["k"]] = WK @ Rt
+                sd[blk["v"]] = WV @ Rt
+                sd[blk["o"]] = Rt @ WO
             else:
-                sd[blk["q"]] = (Rt @ WQ)
-                sd[blk["k"]] = (Rt @ WK)
-                sd[blk["v"]] = (Rt @ WV)
-                sd[blk["o"]] = (WO @ R)
+                sd[blk["q"]] = WQ @ Rt
+                sd[blk["k"]] = WK @ Rt
+                sd[blk["v"]] = WV @ Rt
+                sd[blk["o"]] = R @ WO
 
     def _apply_ffn_pair_permutation_(self, sd: MutableMapping[str, torch.Tensor], P: torch.Tensor, inverse: bool = False):
         if P is None:
             return
         Pt = P.t()
         for blk in self.ffn_blocks:
-            G = sd[blk["gate"]]; U = sd[blk["up"]]; D = sd[blk["down"]]
+            G = sd[blk["gate"]].to('cpu'); U = sd[blk["up"]].to('cpu'); D = sd[blk["down"]].to('cpu')
             if not inverse:
                 sd[blk["gate"]] = P @ G
                 sd[blk["up"]]   = P @ U
@@ -279,15 +300,19 @@ class ReparamPlan:
         Callable[[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]],
         Callable[[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]
     ]:
-        g_attn = _torch_gen(_seed_from(cfg.seed_reparam, f"attn::{k}"))
-        g_ffn  = _torch_gen(_seed_from(cfg.seed_reparam, f"ffn::{k}"))
         # device/dtype choices: follow first param
         sd = self.model.state_dict()
         any_key, any_w = next(iter(sd.items()))
+        # g_attn = _torch_gen(_seed_from(cfg.seed_reparam, f"attn::{k}"), device=any_w.device)
+        # g_ffn  = _torch_gen(_seed_from(cfg.seed_reparam, f"ffn::{k}"), device=any_w.device)
+        g_attn = _torch_gen(_seed_from(cfg.seed_reparam, f"attn::{k}"), device='cpu')
+        g_ffn  = _torch_gen(_seed_from(cfg.seed_reparam, f"ffn::{k}"), device='cpu')
         device, dtype = any_w.device, any_w.dtype
 
-        R = self._sample_head_rotation(g_attn, device, dtype) if cfg.reparam_attention_rotate else None
-        P = self._sample_pair_permutation(sd, g_ffn, device, dtype) if cfg.reparam_ffn_pair_permute else None
+        R = self._sample_head_rotation(g_attn, 'cpu', dtype, wq=sd[self.attn_blocks[0]["q"]]) if cfg.reparam_attention_rotate else None
+        # print(sd[self.attn_blocks[0]["q"]].shape)
+        # shape=2048*2048
+        P = self._sample_pair_permutation(sd, g_ffn, 'cpu', dtype) if cfg.reparam_ffn_pair_permute else None
 
         def T_fwd(sd_in: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
             sd_copy = tree_like(sd_in)
@@ -321,7 +346,7 @@ class PUMTrainer:
         if cfg.verbose:
             logger.setLevel(logging.INFO)
 
-    @torch.no_grad()
+    # @torch.no_grad()
     def run_round(
         self,
         client_unlearn_fn: Callable[[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]],

@@ -139,8 +139,8 @@ def test_harmonic_denoising_linearized(model_kind):
     model = build_model(model_kind)
     cfg = PUMConfig(
         m=6, alpha=[1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
-        sigma_mode="rms_kappa", kappa=0.10,
-        eta_srv=1.0, seed_noise=17, seed_reparam=23,
+        sigma_mode="rms_kappa", kappa=0.10, sigma_fixed=0.01,
+        eta_srv=1.0, seed_noise=17, seed_reparam=23, seed_train=0,
         reparam_attention_rotate=True, reparam_ffn_pair_permute=True,
         verbose=False
     )

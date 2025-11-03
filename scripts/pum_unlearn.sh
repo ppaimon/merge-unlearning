@@ -19,13 +19,13 @@ export CUDA_LAUNCH_BLOCKING=0
 # 1) 设备可见性：按需修改为你的 N 张卡
 #    亦可通过 `GPUS` 环境变量覆盖
 ##########################################
-export CUDA_VISIBLE_DEVICES="${GPUS:-0,1,2,3}"
+export CUDA_VISIBLE_DEVICES="${GPUS:-0}"
 
 ##########################################
 # 8) 训练超参（可按显存/吞吐调节）
 ##########################################
-per_device_train_batch_size=${BATCH_SIZE_PER_GPU:-2}
-gradient_accumulation_steps=${GRAD_ACCUM_STEPS:-4}
+per_device_train_batch_size=${BATCH_SIZE_PER_GPU:-1}
+gradient_accumulation_steps=${GRAD_ACCUM_STEPS:-1}
 
 ##########################################
 # 2) RERUN 开关：True=完全重跑（删除输出目录）
@@ -73,6 +73,7 @@ LAUNCH=(
   accelerate launch
   --config_file configs/accelerate/default_config.yaml
   --num_processes "$GPU_COUNT"
+  # --num_processes 32
   --main_process_port "$MASTER_PORT"
 )
 
@@ -116,12 +117,16 @@ EVAL_PY="$REPO_ROOT/src/eval.py"
 ##########################################
 # PUM–LD 专用可调参数（可按需 sweep）
 ##########################################
-PUM_M="${PUM_M:-6}"
-PUM_ALPHA="${PUM_ALPHA:-[1.0,1.5,2.0,3.0,4.0,6.0]}"
+# PUM_M="${PUM_M:-8}"
+PUM_M="${PUM_M:-2}"
+# PUM_ALPHA="${PUM_ALPHA:-[1.0,1.5,2.0,3.0,4.0,6.0,8.0,10.0]}"
+PUM_ALPHA="${PUM_ALPHA:-[1.0,1.5]}"
+
 PUM_SIGMA_MODE="${PUM_SIGMA_MODE:-rms_kappa}"  # 也可 fixed
 PUM_KAPPA="${PUM_KAPPA:-0.10}"                 # rms_kappa 模式使用
 PUM_SIGMA_FIXED="${PUM_SIGMA_FIXED:-0.05}"     # fixed 模式使用
 PUM_ETA_SRV="${PUM_ETA_SRV:-1.0}"
+PUM_SEED_TRAIN="${PUM_SEED_TRAIN:-0}"
 PUM_SEED_NOISE="${PUM_SEED_NOISE:-17}"
 PUM_SEED_REPARAM="${PUM_SEED_REPARAM:-23}"
 PUM_ROTATE="${PUM_ROTATE:-true}"
@@ -195,6 +200,7 @@ for split in "${SPLITS[@]}"; do
           trainer.pum_cfg.kappa="${PUM_KAPPA}" \
           trainer.pum_cfg.sigma_fixed="${PUM_SIGMA_FIXED}" \
           trainer.pum_cfg.eta_srv="${PUM_ETA_SRV}" \
+          trainer.pum_cfg.seed_train="${PUM_SEED_TRAIN}" \
           trainer.pum_cfg.seed_noise="${PUM_SEED_NOISE}" \
           trainer.pum_cfg.seed_reparam="${PUM_SEED_REPARAM}" \
           trainer.pum_cfg.reparam_attention_rotate="${PUM_ROTATE}" \
@@ -297,6 +303,7 @@ PY
             trainer.pum_cfg.kappa="${PUM_KAPPA}" \
             trainer.pum_cfg.sigma_fixed="${PUM_SIGMA_FIXED}" \
             trainer.pum_cfg.eta_srv="${PUM_ETA_SRV}" \
+            trainer.pum_cfg.seed_train="${PUM_SEED_TRAIN}" \
             trainer.pum_cfg.seed_noise="${PUM_SEED_NOISE}" \
             trainer.pum_cfg.seed_reparam="${PUM_SEED_REPARAM}" \
             trainer.pum_cfg.reparam_attention_rotate="${PUM_ROTATE}" \

@@ -61,6 +61,12 @@ def get_model(model_cfg: DictConfig):
         raise ValueError(
             f"Error {e} while fetching model using {model_handler}.from_pretrained()."
         )
+    
+    if torch.cuda.is_available():
+        model = model.to("cuda")
+        device = next(model.parameters()).device
+        logger.info(f"Model successfully moved to device: {device}")
+    
     tokenizer = get_tokenizer(tokenizer_args)
     return model, tokenizer
 

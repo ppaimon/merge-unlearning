@@ -45,6 +45,8 @@ trainer:
     learning_rate: 1e-5
     weight_decay: 0.01
     num_train_epochs: 10
+    seed: 0
+    output_dir: ${paths.root_dir}/saves/${mode}/${task_name}
     # save_strategy: steps
     # save_steps: 0.5
 

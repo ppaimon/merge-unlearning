@@ -5,9 +5,8 @@ import logging
 from typing import Dict, Any, Optional, Tuple
 
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from transformers import Trainer, TrainingArguments
-from transformers.trainer_utils import TrainOutput
 
 from trainer.base import FinetuneTrainer
 from trainer.unlearn.grad_ascent import GradAscent
@@ -21,9 +20,7 @@ from trainer.unlearn.ceu import CEU
 from trainer.unlearn.satimp import SatImp
 from trainer.unlearn.wga import WGA
 from trainer.unlearn.pdu import PDU
-
-# NEW: PUM–LD engine (no clipping; α‑scaled, linearly dependent copies)
-from trainer.unlearn.pum import PUMTrainer as _PUMEngine, PUMConfig as _PUMCfg
+from trainer.unlearn.pum_ld import PUM_LD
 
 # NEW: epoch-wise reparameterization callback
 from trainer.unlearn.reparam_epochwise import EpochwiseReparamCallback
@@ -118,123 +115,6 @@ def load_trainer(
     # -----------------------------------------------------------------------
 
     return trainer, trainer_args
-
-
-# ==========================================================================================
-# NEW: Registry-friendly wrapper that uses the PUM–LD engine inside a FinetuneTrainer shell
-# ==========================================================================================
-class PUM_LD(FinetuneTrainer):
-    """
-    Registry handler for your PUM–LD method.
-
-    - Accepts `pum_cfg` (forwarded from trainer.pum_cfg by load_trainer).
-    - Uses your engine `_PUMEngine` with `_PUMCfg`.
-    - Runs a single PUM–LD round, saves the resulting model for downstream eval.
-    - Produces a minimal TrainOutput to keep your pipeline consistent.
-    """
-
-    def __init__(
-        self,
-        *args,
-        pum_cfg: Optional[DictConfig] | Optional[dict] = None,
-        # local client unlearning hyperparams (can override in trainer.method_args)
-        local_steps: int = 10,
-        local_lr: float = 1e-4,
-        **kwargs,
-    ):
-        super().__init__(*args, **kwargs)
-        # Convert pum_cfg (DictConfig -> dict) then dataclass
-        if pum_cfg is None:
-            pum_cfg = {}
-        if isinstance(pum_cfg, DictConfig):
-            pum_cfg = OmegaConf.to_container(pum_cfg, resolve=True)
-        assert isinstance(pum_cfg, dict), "pum_cfg must be a DictConfig or dict"
-
-        self._pum_engine = _PUMEngine(self.model, _PUMCfg(**pum_cfg))
-        self._pum_local_steps = int(local_steps)
-        self._pum_local_lr = float(local_lr)
-
-        logger.info(
-            "PUM_LD initialized: local_steps=%d, local_lr=%.2e; pum_cfg=%s",
-            self._pum_local_steps, self._pum_local_lr, str(pum_cfg)
-        )
-
-    # --------------------------
-    # Client-side unlearning fn
-    # --------------------------
-    def _client_unlearn_fn(self, theta_pub_state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Runs a few local steps on the forget (train) dataset starting from theta_pub.
-        Returns Δ relative to theta_pub (same param space).
-        """
-        # Build a detached copy with published weights
-        client_model = copy.deepcopy(self.model)
-        client_model.load_state_dict(theta_pub_state_dict, strict=True)
-        device = self.args.device if hasattr(self.args, "device") else next(client_model.parameters()).device
-        client_model.to(device)
-        client_model.train()
-
-        optimizer = torch.optim.AdamW(client_model.parameters(), lr=self._pum_local_lr)
-
-        dl = self.get_train_dataloader()  # by design, your train_dataset is the forget split
-        it = iter(dl)
-
-        steps = self._pum_local_steps
-        for _ in range(steps):
-            try:
-                batch = next(it)
-            except StopIteration:
-                it = iter(dl)
-                batch = next(it)
-
-            # Move to device (use Trainer's utility to stay consistent)
-            batch = self._prepare_inputs(batch)
-
-            # Most HF causal LMs compute loss if labels are given
-            outputs = client_model(**batch)
-            if hasattr(outputs, "loss") and outputs.loss is not None:
-                loss = outputs.loss
-            else:
-                # Fallback CE if the model did not compute loss internally
-                logits = outputs.logits
-                labels = batch.get("labels", None)
-                if labels is None:
-                    raise RuntimeError("Batch has no 'labels' for loss computation.")
-                loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
-                loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
-
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-
-        # Return Δ = after - base
-        after = client_model.state_dict()
-        delta = {k: (after[k] - theta_pub_state_dict[k]) for k in theta_pub_state_dict.keys()}
-        return delta
-
-    # --------------------------
-    # One PUM–LD round + save
-    # --------------------------
-    def train(self, *args, **kwargs) -> TrainOutput:
-        # Run the engine (this updates self.model in-place)
-        new_state, bar_delta = self._pum_engine.run_round(self._client_unlearn_fn)
-
-        # Save artifacts so eval can load from run_dir
-        # (save_model persists config, tokenizer if set)
-        self.save_model()
-        if self.tokenizer is not None:
-            self.tokenizer.save_pretrained(self.args.output_dir)
-
-        # Minimal training metadata so your scripts/postcheck remain happy
-        self.state.global_step = max(self.state.global_step, 1)
-        metrics = {"loss": 0.0, "pum_ld_rounds": 1}
-        self.log(metrics)
-        try:
-            self.save_state()
-        except Exception:
-            pass
-
-        return TrainOutput(global_step=self.state.global_step, training_loss=0.0, metrics=metrics)
 
 
 # Register Finetuning Trainer

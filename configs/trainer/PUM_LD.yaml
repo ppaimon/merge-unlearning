@@ -9,6 +9,7 @@ pum_cfg:            # forwarded to the handler as method_args.pum_cfg (via load_
   sigma_fixed: 0.05
   kappa: 0.10
   eta_srv: 1.0
+  seed_train: 0
   seed_noise: 17
   seed_reparam: 23
   reparam_attention_rotate: true
@@ -28,3 +29,4 @@ args:
   gradient_accumulation_steps: 4
   ddp_find_unused_parameters: true
   gradient_checkpointing: true
+  do_train: True
