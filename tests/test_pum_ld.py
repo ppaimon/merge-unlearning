@@ -110,11 +110,16 @@ def test_zero_sum_basis(model_kind):
 # Test 2: T^{-1}(T(W)) ≈ W for sampled reparams
 # -------------------------------------------------------------------
 @pytest.mark.parametrize("model_kind", [os.getenv("PUM_TEST_MODEL", "toy")])
-def test_reparam_inverse_identity(model_kind):
+@pytest.mark.parametrize("hq_hkv", [(4, 4), (4, 2)])  # MHA and GQA
+def test_reparam_inverse_identity(model_kind, hq_hkv):
     model = build_model(model_kind)
-    cfg = PUMConfig(m=4, sigma_mode="fixed", sigma_fixed=0.01, verbose=False)
+    H_Q, H_KV = hq_hkv
+    cfg = PUMConfig(
+        m=4, sigma_mode="fixed", sigma_fixed=0.01, verbose=False,
+        attn_num_heads=H_Q, attn_num_kv_heads=H_KV,
+        reparam_attention_rotate=True, reparam_ffn_pair_permute=True
+    )
     base_sd = model.state_dict()
-
     plan = ReparamPlan(model, cfg)
     T_fwd, T_inv = plan.sample_T(k=0, cfg=cfg)
 
@@ -127,8 +132,7 @@ def test_reparam_inverse_identity(model_kind):
         if k in W_rec:
             d = (W[k] - W_rec[k]).abs().max().item()
             max_abs = max(max_abs, d)
-    assert max_abs < 1e-5, f"Reparam inverse not identity: max_abs={max_abs}"
-
+    assert max_abs < 1e-5, f"Reparam inverse not identity (H_Q={H_Q},H_KV={H_KV}): max_abs={max_abs}"
 
 # -------------------------------------------------------------------
 # Test 3: Harmonic de-noising cancels α_k-correlated term (first-order)

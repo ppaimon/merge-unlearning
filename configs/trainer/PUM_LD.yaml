@@ -16,6 +16,7 @@ pum_cfg:            # forwarded to the handler as method_args.pum_cfg (via load_
   reparam_ffn_pair_permute: true
   reparam_residual_permute: false
   attn_num_heads: null
+  attn_num_kv_heads: null 
   verbose: true
 
 # Optional: local client steps & lr
