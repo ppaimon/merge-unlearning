@@ -209,21 +209,23 @@ class ReparamPlan:
             col = wq.shape[1]
             for cand in [64, 48, 40, 32, 24, 16, 12, 8, 6, 4, 2]:
                 if col % cand == 0: self.H_Q = cand; break
-        if self.H_KV is None:
+        if self.H_KV is None: 
             self.H_KV = self.H_Q  # MHA default
 
         # head dimension is taken on the COLUMN axis (we right-multiply)
         wq = sd[self.attn_blocks[0]["q"]]  # [out, in]
-        self.col_dim = wq.shape[1]
-        assert self.col_dim % self.H_Q == 0, f"Input feature dim {self.col_dim} not divisible by H_Q={self.H_Q}"
-        self.d_h = self.col_dim // self.H_Q
+        self.row_dim = wq.shape[0]         # H_Q * d_h  (output axis)
+        self.in_dim  = wq.shape[1]         # d_model    (input axis)
+        assert self.row_dim % self.H_Q == 0, f"Output dim {self.row_dim} not divisible by H_Q={self.H_Q}"
+        self.d_h = self.row_dim // self.H_Q
         assert (self.H_Q % self.H_KV) == 0, f"H_Q={self.H_Q} must be a multiple of H_KV={self.H_KV} (no head perms)."
         self.g = self.H_Q // self.H_KV  # queries per KV group
 
+
         if cfg.verbose:
             logger.info(
-                "ReparamPlan[MHA/GQA]: H_Q=%s, H_KV=%s, d_h=%s, col_dim=%s, layers=%d",
-                self.H_Q, self.H_KV, self.d_h, self.col_dim, len(self.attn_blocks)
+                "ReparamPlan[MHA/GQA]: H_Q=%s, H_KV=%s, d_h=%s, row_dim = %s, in_dim=%s, layers=%d",
+                self.H_Q, self.H_KV, self.d_h, self.row_dim, self.in_dim, len(self.attn_blocks)
             )
 
     # --- KV orthogonal blocks ---
@@ -253,20 +255,27 @@ class ReparamPlan:
         """Apply or invert the attention reparameterization on weight matrices."""
         Ut = U.t(); SKVt = S_KV.t()
         for blk in self.attn_blocks:
+            if self.cfg.verbose:
+                qk = self.attn_blocks[0]
+                _WQ, _WK, _WV, _WO = sd[qk["q"]], sd[qk["k"]], sd[qk["v"]], sd[qk["o"]]
+                logger.info("ATTN reparam: WQ%r, WK%r, WV%r, WO%r | U%r, S_KV%r",
+                            tuple(_WQ.shape), tuple(_WK.shape), tuple(_WV.shape), tuple(_WO.shape),
+                            tuple(U.shape), tuple(S_KV.shape))
+
             WQ = sd[blk["q"]].to('cpu')
             WK = sd[blk["k"]].to('cpu')
             WV = sd[blk["v"]].to('cpu')
             WO = sd[blk["o"]].to('cpu')
             if not inverse:
-                sd[blk["q"]] = WQ @ U        # right-mul
+                sd[blk["q"]] = Ut @ WQ        # right-mul
                 sd[blk["k"]] = SKVt @ WK
                 sd[blk["v"]] = SKVt @ WV
-                sd[blk["o"]] = Ut @ WO       # left-mul by U^T
+                sd[blk["o"]] = WO @ U       # left-mul by U^T
             else:
-                sd[blk["q"]] = WQ @ Ut       # undo
+                sd[blk["q"]] = U @ WQ       # undo
                 sd[blk["k"]] = S_KV @ WK
                 sd[blk["v"]] = S_KV @ WV
-                sd[blk["o"]] = U @ WO        # left-mul by U
+                sd[blk["o"]] = WO @ Ut        # left-mul by U
 
     def _apply_ffn_pair_permutation_(self, sd: MutableMapping[str, torch.Tensor], P: torch.Tensor, inverse: bool = False):
         # (unchanged)
