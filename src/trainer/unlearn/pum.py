@@ -11,6 +11,7 @@ import logging
 import torch
 from torch import nn
 
+import math
 logger = logging.getLogger(__name__)
 
 
@@ -50,36 +51,37 @@ def tree_copy_into_(dst: MutableMapping[str, torch.Tensor], src: Mapping[str, to
 # Config
 # -----------------------------
 
-# only for save hyoeroarams, no functions in the method
+from dataclasses import dataclass
+from typing import List, Dict, MutableMapping, Mapping, Tuple, Optional
+
 @dataclass
 class PUMConfig:
-    # number of copies
-    m: int
-    # α scaling per copy (must match m)
-    alpha: List[float]
-
-    # σ strategy: fixed scalar or per-layer RMS * κ
-    sigma_mode: str # = "rms_kappa"   # {"fixed", "rms_kappa"}
-    sigma_fixed: float #= 0.0
-    kappa: float
-
-    # server step size on aggregated delta
-    eta_srv: float #= 1.0
-
-    # deterministic seeds
-    seed_noise: int
+    # --------- non-defaults (must come first) ---------
+    m: int                                  # number of copies
+    alpha: List[float]                      # α scaling per copy (len == m)
+    sigma_mode: str                         # {"fixed", "rms_kappa"}
+    kappa: float                            # used when sigma_mode == "rms_kappa"
+    seed_noise: int                         # deterministic seeds
     seed_reparam: int
     seed_train: int
 
+    # --------- defaults (may follow) ---------
+    sigma_fixed: float = 0.0                # used when sigma_mode == "fixed"
+    eta_srv: float = 1.0                    # server step size on aggregated delta
+
     # Reparam toggles
     reparam_attention_rotate: bool = True
+    # If True, S_j are per‑RoPE‑plane 2×2 rotations (commute with RoPE)
+    reparam_attention_rope_aware: bool = True
     reparam_ffn_pair_permute: bool = True
     reparam_residual_permute: bool = False  # optional
 
-    # Hint in case model.config lacks this
-    attn_num_heads: int | None = None
-    attn_num_kv_heads: int | None = None       # H_KV
+    # Head counts (fallback to model.config when None)
+    attn_num_heads: Optional[int] = None    # H_Q
+    attn_num_kv_heads: Optional[int] = None # H_KV
+
     verbose: bool = True
+
 
 
 # -----------------------------
@@ -184,60 +186,128 @@ class ReparamPlan:
         i = 0
         while True:
             prefix = f"model.layers.{i}."
+
+            # attention weights
             qk = prefix + "self_attn.q_proj.weight"
             kk = prefix + "self_attn.k_proj.weight"
             vk = prefix + "self_attn.v_proj.weight"
             ok = prefix + "self_attn.o_proj.weight"
+
+            # optional attention biases
+            qb = prefix + "self_attn.q_proj.bias"
+            kb = prefix + "self_attn.k_proj.bias"
+            vb = prefix + "self_attn.v_proj.bias"
+            ob = prefix + "self_attn.o_proj.bias"
+
+            # ffn weights
             gate = prefix + "mlp.gate_proj.weight"
             up   = prefix + "mlp.up_proj.weight"
             down = prefix + "mlp.down_proj.weight"
+
+            # optional ffn biases
+            gate_b = prefix + "mlp.gate_proj.bias"
+            up_b   = prefix + "mlp.up_proj.bias"
+            down_b = prefix + "mlp.down_proj.bias"
+
             found_attn = (qk in sd and kk in sd and vk in sd and ok in sd)
             found_ffn  = (gate in sd and up in sd and down in sd)
-            if found_attn: self.attn_blocks.append({"q": qk, "k": kk, "v": vk, "o": ok})
-            if found_ffn:  self.ffn_blocks.append({"gate": gate, "up": up, "down": down})
+
+            if found_attn:
+                blk = {"q": qk, "k": kk, "v": vk, "o": ok}
+                if qb in sd: blk["qb"] = qb
+                if kb in sd: blk["kb"] = kb
+                if vb in sd: blk["vb"] = vb
+                if ob in sd: blk["ob"] = ob  # (bias of o_proj stays unchanged in our map)
+                self.attn_blocks.append(blk)
+
+            if found_ffn:
+                blk = {"gate": gate, "up": up, "down": down}
+                if gate_b in sd: blk["gate_b"] = gate_b
+                if up_b in sd:   blk["up_b"]   = up_b
+                if down_b in sd: blk["down_b"] = down_b
+                self.ffn_blocks.append(blk)
+
             if (not found_attn) and (not found_ffn):
                 if i > 0: break
                 else: raise ValueError("no layer is found for model")
             i += 1
 
-        # head counts (defaults -> model.config -> fallbacks)
+
         self.H_Q  = cfg.attn_num_heads or int(getattr(getattr(model, "config", None), "num_attention_heads", 0)) or None
         self.H_KV = cfg.attn_num_kv_heads or int(getattr(getattr(model, "config", None), "num_key_value_heads", 0)) or None
         if self.H_Q is None:
-            # last resort: infer a plausible divisor of column dim
             wq = sd[self.attn_blocks[0]["q"]]  # [out, in]
-            col = wq.shape[1]
+            # fall back: try common divisors of the *row* dim
+            row = wq.shape[0]
             for cand in [64, 48, 40, 32, 24, 16, 12, 8, 6, 4, 2]:
-                if col % cand == 0: self.H_Q = cand; break
-        if self.H_KV is None: 
-            self.H_KV = self.H_Q  # MHA default
+                if row % cand == 0: self.H_Q = cand; break
+        if self.H_KV is None:
+            self.H_KV = self.H_Q  # default to MHA
 
-        # head dimension is taken on the COLUMN axis (we right-multiply)
-        wq = sd[self.attn_blocks[0]["q"]]  # [out, in]
-        self.row_dim = wq.shape[0]         # H_Q * d_h  (output axis)
-        self.in_dim  = wq.shape[1]         # d_model    (input axis)
+        wq = sd[self.attn_blocks[0]["q"]]  # [out, in] = [(H_Q*d_h), d_model]
+        self.row_dim = wq.shape[0]
+        self.in_dim  = wq.shape[1]
         assert self.row_dim % self.H_Q == 0, f"Output dim {self.row_dim} not divisible by H_Q={self.H_Q}"
         self.d_h = self.row_dim // self.H_Q
         assert (self.H_Q % self.H_KV) == 0, f"H_Q={self.H_Q} must be a multiple of H_KV={self.H_KV} (no head perms)."
         self.g = self.H_Q // self.H_KV  # queries per KV group
 
-
         if cfg.verbose:
             logger.info(
-                "ReparamPlan[MHA/GQA]: H_Q=%s, H_KV=%s, d_h=%s, row_dim = %s, in_dim=%s, layers=%d",
+                "ReparamPlan[MHA/GQA]: H_Q=%s, H_KV=%s, d_h=%s, row_dim=%s, in_dim=%s, layers=%d",
                 self.H_Q, self.H_KV, self.d_h, self.row_dim, self.in_dim, len(self.attn_blocks)
             )
 
-    # --- KV orthogonal blocks ---
+
+    def _rope_block_rotation(self, gen: torch.Generator, device, dtype) -> torch.Tensor:
+        """
+        LLaMA-style RoPE pairs channels as (i, i + d_h//2) (half-split), not (2i, 2i+1).
+        Build S that is a product of independent 2×2 rotations on those pairs:
+
+            S = [[diag(cos φ), -diag(sin φ)],
+                [diag(sin φ),  diag(cos φ)]]
+
+        This S commutes with HF's apply_rotary_pos_emb implementation.
+        """
+        dh = self.d_h
+        assert dh % 2 == 0, "RoPE-aware rotation requires even head_dim for LLaMA-style pairing"
+        n = dh // 2
+
+        angles = 2.0 * math.pi * torch.rand(n, generator=gen, device=device, dtype=torch.float32)
+        c = torch.cos(angles).to(dtype=dtype)
+        s = torch.sin(angles).to(dtype=dtype)
+
+        Dc = torch.diag(c).to(device=device, dtype=dtype)
+        Ds = torch.diag(s).to(device=device, dtype=dtype)
+
+        top = torch.cat([Dc, -Ds], dim=1)   # (n, 2n)
+        bot = torch.cat([Ds,  Dc], dim=1)   # (n, 2n)
+        S = torch.cat([top, bot], dim=0)    # (2n, 2n) == (dh, dh)
+        return S
+
+
+    def _qr_orthogonal(self, gen: torch.Generator, device, dtype) -> torch.Tensor:
+        A = torch.randn((self.d_h, self.d_h), generator=gen, device=device, dtype=torch.float32)
+        Q, _ = torch.linalg.qr(A, mode="reduced")
+        if torch.det(Q) < 0:
+            Q[:, 0] = -Q[:, 0]
+        return Q.to(dtype=dtype)
+
     def _sample_S_KV(self, gen: torch.Generator, device, dtype) -> torch.Tensor:
-        """S_KV = blkdiag(S_1,...,S_{H_KV}), S_p in O(d_h)."""
+        """
+        S_KV = blkdiag(S_1,...,S_{H_KV}).
+        - If rope_aware: S_j are 2x2 rotations per RoPE plane (SO(2)^(d_h/2)).
+        - Else:          S_j are QR-orthogonal in O(d_h).
+        """
         blocks = []
         for _ in range(self.H_KV):
-            A = torch.randn((self.d_h, self.d_h), generator=gen, device=device, dtype=torch.float32)
-            Q, _ = torch.linalg.qr(A, mode="reduced")
-            if torch.det(Q) < 0: Q[:, 0] = -Q[:, 0]  # proper rotation
-            blocks.append(Q.to(dtype=dtype))
-        return torch.block_diag(*blocks)  # shape: [H_KV*d_h, H_KV*d_h]
+            if self.cfg.reparam_attention_rope_aware:
+                S = self._rope_block_rotation(gen, device, dtype)
+            else:
+                S = self._qr_orthogonal(gen, device, dtype)
+            blocks.append(S)
+        return torch.block_diag(*blocks)
+
 
     # --- lift S_KV to queries via fixed assignment A (no permutations) ---
     def _default_assignment(self) -> List[int]:
@@ -252,45 +322,79 @@ class ReparamPlan:
         return torch.block_diag(*rep)   # [H_Q*d_h, H_Q*d_h] == [col_dim, col_dim]
 
     def _apply_attention_T_(self, sd: MutableMapping[str, torch.Tensor], U: torch.Tensor, S_KV: torch.Tensor, inverse: bool = False):
-        """Apply or invert the attention reparameterization on weight matrices."""
+        """
+        PyTorch weight orientation:
+        W_Q, W_K, W_V: (out, in)  => change of basis on 'out' via LEFT multiply
+        W_O          : (out, in)  => change of basis on 'in'  via RIGHT multiply
+
+        Forward map (matches LaTeX after transposition):
+        W_Q <- U^T @ W_Q          ;  b_Q <- U^T @ b_Q (if exists)
+        W_K <- S_KV^T @ W_K       ;  b_K <- S_KV^T @ b_K
+        W_V <- S_KV^T @ W_V       ;  b_V <- S_KV^T @ b_V
+        W_O <- W_O @ U            ;  b_O unchanged
+
+        Inverse:
+        W_Q <- U @ W_Q            ;  b_Q <- U @ b_Q
+        W_K <- S_KV @ W_K         ;  b_K <- S_KV @ b_K
+        W_V <- S_KV @ W_V         ;  b_V <- S_KV @ b_V
+        W_O <- W_O @ U^T          ;  b_O unchanged
+        """
         Ut = U.t(); SKVt = S_KV.t()
         for blk in self.attn_blocks:
-            if self.cfg.verbose:
-                qk = self.attn_blocks[0]
-                _WQ, _WK, _WV, _WO = sd[qk["q"]], sd[qk["k"]], sd[qk["v"]], sd[qk["o"]]
-                logger.info("ATTN reparam: WQ%r, WK%r, WV%r, WO%r | U%r, S_KV%r",
-                            tuple(_WQ.shape), tuple(_WK.shape), tuple(_WV.shape), tuple(_WO.shape),
-                            tuple(U.shape), tuple(S_KV.shape))
-
             WQ = sd[blk["q"]].to('cpu')
             WK = sd[blk["k"]].to('cpu')
             WV = sd[blk["v"]].to('cpu')
             WO = sd[blk["o"]].to('cpu')
+            qb = sd[blk["qb"]].to('cpu') if "qb" in blk else None
+            kb = sd[blk["kb"]].to('cpu') if "kb" in blk else None
+            vb = sd[blk["vb"]].to('cpu') if "vb" in blk else None
+            # ob (bias of o_proj) remains unchanged
+
             if not inverse:
-                sd[blk["q"]] = Ut @ WQ        # right-mul
+                sd[blk["q"]] = Ut @ WQ
                 sd[blk["k"]] = SKVt @ WK
                 sd[blk["v"]] = SKVt @ WV
-                sd[blk["o"]] = WO @ U       # left-mul by U^T
+                sd[blk["o"]] = WO @ U
+                if qb is not None: sd[blk["qb"]] = Ut @ qb
+                if kb is not None: sd[blk["kb"]] = SKVt @ kb
+                if vb is not None: sd[blk["vb"]] = SKVt @ vb
             else:
-                sd[blk["q"]] = U @ WQ       # undo
+                sd[blk["q"]] = U @ WQ
                 sd[blk["k"]] = S_KV @ WK
                 sd[blk["v"]] = S_KV @ WV
-                sd[blk["o"]] = WO @ Ut        # left-mul by U
+                sd[blk["o"]] = WO @ Ut
+                if qb is not None: sd[blk["qb"]] = U @ qb
+                if kb is not None: sd[blk["kb"]] = S_KV @ kb
+                if vb is not None: sd[blk["vb"]] = S_KV @ vb
+
 
     def _apply_ffn_pair_permutation_(self, sd: MutableMapping[str, torch.Tensor], P: torch.Tensor, inverse: bool = False):
-        # (unchanged)
         if P is None: return
         Pt = P.t()
         for blk in self.ffn_blocks:
-            G = sd[blk["gate"]].to('cpu'); U_ = sd[blk["up"]].to('cpu'); D = sd[blk["down"]].to('cpu')
+            G  = sd[blk["gate"]].to('cpu')
+            U_ = sd[blk["up"]].to('cpu')
+            D  = sd[blk["down"]].to('cpu')
+            Gb = sd[blk["gate_b"]].to('cpu') if "gate_b" in blk else None
+            Ub = sd[blk["up_b"]].to('cpu')   if "up_b"   in blk else None
+            Db = sd[blk["down_b"]].to('cpu') if "down_b" in blk else None
+
             if not inverse:
                 sd[blk["gate"]] = P  @ G
                 sd[blk["up"]]   = P  @ U_
                 sd[blk["down"]] = D  @ Pt
+                if Gb is not None: sd[blk["gate_b"]] = P  @ Gb
+                if Ub is not None: sd[blk["up_b"]]   = P  @ Ub
+                # b2 (down bias) is on the *output* axis of W2 (unchanged by right-mul on input); keep it
             else:
                 sd[blk["gate"]] = Pt @ G
                 sd[blk["up"]]   = Pt @ U_
                 sd[blk["down"]] = D  @ P
+                if Gb is not None: sd[blk["gate_b"]] = Pt @ Gb
+                if Ub is not None: sd[blk["up_b"]]   = Pt @ Ub
+                # down_b unchanged in either direction
+
+
 
     def _sample_pair_permutation(self, sd: Mapping[str, torch.Tensor], gen: torch.Generator, device, dtype) -> torch.Tensor | None:
         # (unchanged)
@@ -305,13 +409,18 @@ class ReparamPlan:
         P = torch.eye(inter, device=device, dtype=dtype)[perm_list, :]
         return P
 
-    def sample_T(self, k: int, cfg: PUMConfig):
+    def sample_T(self, k: int, cfg: PUMConfig, round_idx: Optional[int] = None):
+        """
+        Sample the per-copy reparameterization (attention + ffn), deterministically
+        from (seed_reparam, round_idx, k).
+        """
         sd = self.model.state_dict()
         any_key, any_w = next(iter(sd.items()))
         device, dtype = 'cpu', any_w.dtype
 
-        g_attn = _torch_gen(_seed_from(cfg.seed_reparam, f"attn::{k}"), device=device)
-        g_ffn  = _torch_gen(_seed_from(cfg.seed_reparam, f"ffn::{k}"),  device=device)
+        rtag = f"r{round_idx}" if round_idx is not None else "r*"
+        g_attn = _torch_gen(_seed_from(cfg.seed_reparam, f"attn::{rtag}::{k}"), device=device)
+        g_ffn  = _torch_gen(_seed_from(cfg.seed_reparam, f"ffn::{rtag}::{k}"),  device=device)
 
         S_KV = self._sample_S_KV(g_attn, device, dtype) if cfg.reparam_attention_rotate else None
         A = self._default_assignment() if S_KV is not None else None
@@ -335,6 +444,8 @@ class ReparamPlan:
 
 
 
+
+
 # -----------------------------
 # Main trainer
 # -----------------------------
@@ -352,10 +463,12 @@ class PUMTrainer:
         if cfg.verbose:
             logger.setLevel(logging.INFO)
 
-    # @torch.no_grad()
+
+
     def run_round(
         self,
         client_unlearn_fn: Callable[[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]],
+        round_idx: int | None = None,   # NEW: optional round index
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         cfg = self.cfg
         base_sd = self.model.state_dict()
@@ -374,7 +487,8 @@ class PUMTrainer:
         S1 = tree_zeros_like(base_sd)
 
         for k in range(cfg.m):
-            T_fwd, T_inv = plan.sample_T(k, cfg)
+            # pass round_idx through to seed the reparam deterministically for this round
+            T_fwd, T_inv = plan.sample_T(k, cfg, round_idx=round_idx)
             theta_pub = T_fwd(tree_add(base_sd, eps_by_copy[k]))
             delta_client = client_unlearn_fn(theta_pub)     # Δ in T-space
             delta_srv = T_inv(delta_client)                 # back to server/original

@@ -117,7 +117,15 @@ class PUM_LD(FinetuneTrainer):
 
     def train(self, *args, **kwargs) -> TrainOutput:
         # Run the engine (updates self.model in-place)
-        new_state, bar_delta = self._pum_engine.run_round(self._client_unlearn_fn)
+        # ... in __init__ or train(), define rounds (default 1)
+        R = getattr(self, "rounds", 1)
+        # if you store rounds under method_args, do:
+        # R = getattr(self.method_args, "rounds", 1)
+
+        for r in range(R):
+            new_state, bar_delta = self._pum_engine.run_round(self._client_unlearn_fn, round_idx=r)
+            # logging/saving per round if you like
+
 
         # -------------------------
         # Determine main process (rank 0) for saving
