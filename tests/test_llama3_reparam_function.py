@@ -132,5 +132,9 @@ def test_llama3_reparam_function_invariance_subset():
             worst_k = k
 
     assert max_abs_w < 1e-5, f"Inverse did not restore weights (max|Δ|={max_abs_w:.3e}, key={worst_k})"
+    print(f"[METRIC] max_abs_logits={max_abs_logits:.3e}")
+    print(f"[METRIC] max_abs_w    ={max_abs_w:.3e} (key={worst_k})")
+
 
 # pytest -q tests/test_llama3_reparam_function.py::test_llama3_reparam_function_invariance_subset
+#    one layer

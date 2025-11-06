@@ -137,6 +137,16 @@ python setup_data.py --eval # saves/eval now contains evaluation results of the 
 # into `saves/eval`, used for evaluating unlearning across supported benchmarks.
 # Additional datasets (e.g., WMDP) are supported — run below for options:
 # python setup_data.py --help
+
+
+#
+# 在 open-unlearning 仓库的根目录执行
+mkdir -p data
+curl -L https://huggingface.co/datasets/open-unlearning/idk/raw/main/idk.jsonl -o data/idk.jsonl
+# 简单校验
+head -n 1 data/idk.jsonl
+wc -l data/idk.jsonl
+
 ```
 
 ---
@@ -160,6 +170,15 @@ An example command for launching an unlearning process with `GradAscent` on the 
 ```bash
 python src/train.py --config-name=unlearn.yaml experiment=unlearn/tofu/default \
   forget_split=forget10 retain_split=retain90 trainer=GradAscent task_name=SAMPLE_UNLEARN
+```
+
+An example command for PUM:
+
+```bash
+python src/train.py --config-name=unlearn.yaml \
+  experiment=unlearn/tofu/default \
+  trainer=GradAscentPUM \
+  task_name=PUM_GA_3POINT
 ```
 
 - `experiment`- Path to the Hydra config file [`configs/experiment/unlearn/tofu/default.yaml`](configs/experiment/unlearn/tofu/default.yaml) with default experimental settings for TOFU unlearning, e.g. train dataset, eval benchmark details, model paths etc..

@@ -57,30 +57,32 @@ from typing import List, Dict, MutableMapping, Mapping, Tuple, Optional
 @dataclass
 class PUMConfig:
     # --------- non-defaults (must come first) ---------
-    m: int                                  # number of copies
-    alpha: List[float]                      # α scaling per copy (len == m)
-    sigma_mode: str                         # {"fixed", "rms_kappa"}
-    kappa: float                            # used when sigma_mode == "rms_kappa"
-    seed_noise: int                         # deterministic seeds
+    m: int
+    alpha: List[float]
+    sigma_mode: str              # {"fixed", "rms_kappa"}
+    kappa: float
+    seed_noise: int
     seed_reparam: int
     seed_train: int
 
-    # --------- defaults (may follow) ---------
-    sigma_fixed: float = 0.0                # used when sigma_mode == "fixed"
-    eta_srv: float = 1.0                    # server step size on aggregated delta
+    # --------- defaults ---------
+    sigma_fixed: float = 0.0
+    eta_srv: float = 1.0
 
-    # Reparam toggles
+    # Reparam toggles ...
     reparam_attention_rotate: bool = True
-    # If True, S_j are per‑RoPE‑plane 2×2 rotations (commute with RoPE)
     reparam_attention_rope_aware: bool = True
     reparam_ffn_pair_permute: bool = True
-    reparam_residual_permute: bool = False  # optional
+    reparam_residual_permute: bool = False
 
-    # Head counts (fallback to model.config when None)
-    attn_num_heads: Optional[int] = None    # H_Q
-    attn_num_kv_heads: Optional[int] = None # H_KV
+    attn_num_heads: Optional[int] = None
+    attn_num_kv_heads: Optional[int] = None
 
     verbose: bool = True
+
+    # --- NEW ---
+    sigma_ref: str = "params"          # {"params","task_vector"}；"task_vector" 时按任务向量计算 σ
+    noise_generator: str = "gaussian"  # {"gaussian","uni","cos"}
 
 
 
@@ -106,17 +108,34 @@ def _torch_gen(seed: int, device) -> torch.Generator:
 def _rms(x: torch.Tensor) -> float:
     return float(torch.sqrt(torch.mean(x.float() * x.float())).item() + 1e-12)
 
-def compute_sigma_by_layer(params: Mapping[str, torch.Tensor], cfg: PUMConfig) -> Dict[str, float]:
-    out = {}
+def compute_sigma_by_layer(
+    params: Mapping[str, torch.Tensor],
+    cfg: PUMConfig,
+    ref_map: Mapping[str, torch.Tensor] | None = None,   # NEW
+) -> Dict[str, float]:
+    """
+    当 cfg.sigma_mode == "rms_kappa" 时：
+      - 若 cfg.sigma_ref == "task_vector"，则从 ref_map[k] 取参考张量（须与 params 对齐），
+        每层 σ_ℓ = κ * RMS(ref_map[ℓ])；
+      - 否则，按当前参数 params[ℓ] 求 RMS（原有行为）。
+    """
+    out: Dict[str, float] = {}
     if cfg.sigma_mode == "fixed":
         for k in params:
             out[k] = float(cfg.sigma_fixed)
-    elif cfg.sigma_mode == "rms_kappa":
+        return out
+
+    if cfg.sigma_mode == "rms_kappa":
+        use_task_vec = (cfg.sigma_ref.lower() == "task_vector")
+        if use_task_vec and ref_map is None:
+            raise ValueError("sigma_ref='task_vector' 需要提供 ref_map（例如任务向量）。")
+
         for k, v in params.items():
-            out[k] = float(cfg.kappa * _rms(v))
-    else:
-        raise ValueError(f"Unknown sigma_mode: {cfg.sigma_mode}")
-    return out
+            base_t = ref_map[k] if (use_task_vec and (k in ref_map)) else v
+            out[k] = float(cfg.kappa * _rms(base_t))
+        return out
+
+    raise ValueError(f"Unknown sigma_mode: {cfg.sigma_mode}")
 
 
 # -----------------------------
@@ -129,33 +148,48 @@ def generate_ld_noise_by_copy(
     cfg: PUMConfig,
 ) -> List[Dict[str, torch.Tensor]]:
     """
-    Returns: list length m with per-copy noise state_dicts (same keys as params).
-    For each key ℓ:
-      - draw z_{k,ℓ} ~ N(0, σ_ℓ^2 I)
-      - ε^0_{k,ℓ} = sqrt(m/(m-1)) (z_{k,ℓ} - mean_k z_{k,ℓ})
-      - publish ε_{k,ℓ} = α_k ε^0_{k,ℓ}  (linearly dependent across copies; not zero-sum)
+    ε^0_{k,ℓ} = sqrt(m/(m-1)) (z_{k,ℓ} - mean_k z_{k,ℓ}),  ε_{k,ℓ} = α_k ε^0_{k,ℓ}
+    其中 z_{k,ℓ} 的元素独立同分布，分布由 cfg.noise_generator 控制：
+      - 'gaussian' : N(0, σ_ℓ^2)
+      - 'uni'      : U[-σ_ℓ, σ_ℓ]
+      - 'cos'      : σ_ℓ * cos(π * U[0,1])
     """
     m = cfg.m
-    alpha = cfg.alpha
-    assert len(alpha) == m, f"len(alpha)={len(alpha)} must equal m={m}"
-
-    eps0_by_key: Dict[str, List[torch.Tensor]] = {k: [None] * m for k in params.keys()}
+    assert len(cfg.alpha) == m, f"len(alpha)={len(cfg.alpha)} must equal m={m}"
+    mode = cfg.noise_generator.lower()
     eps_by_copy: List[Dict[str, torch.Tensor]] = [tree_zeros_like(params) for _ in range(m)]
 
+    def _draw(shape, sigma, gen, dtype) -> torch.Tensor:
+        if sigma == 0.0:
+            return torch.zeros(shape, device="cpu", dtype=torch.float32)
+        if mode in ("gaussian", "normal"):
+            z = torch.normal(0.0, sigma, size=shape, generator=gen, device="cpu", dtype=torch.float32)
+        elif mode in ("uni", "uniform"):
+            u = torch.rand(shape, generator=gen, device="cpu", dtype=torch.float32)
+            z = (2.0 * u - 1.0) * sigma
+        elif mode in ("cos", "cosine"):
+            u = torch.rand(shape, generator=gen, device="cpu", dtype=torch.float32)
+            z = sigma * torch.cos(math.pi * u)
+        else:
+            raise ValueError(f"Unknown noise_generator: {cfg.noise_generator}")
+        return z.to(dtype=dtype)
+
     for name, w in params.items():
-        sigma = sigmas[name]
-        gen_key = _torch_gen(_seed_from(cfg.seed_noise, f"noise::{name}"), device="cpu")
-        # z_k ~ N(0, σ^2 I)
-        zs = [torch.normal(0.0, sigma, size=w.shape, generator=gen_key, device="cpu", dtype=w.dtype) for _ in range(m)]
+        sigma = float(sigmas[name])
+        gen_key = _torch_gen(_seed_from(cfg.seed_noise, f"noise::{name}::{mode}"), device="cpu")
+
+        # i.i.d. draws per-copy
+        zs = [_draw(w.shape, sigma, gen_key, dtype=torch.float32) for _ in range(m)]
         z_bar = sum(zs) / m
         scale = math.sqrt(m / (m - 1.0))
+        eps0 = [scale * (zk - z_bar) for zk in zs]  # zero-sum across copies
+
         for k in range(m):
-            eps0_by_key[name][k] = scale * (zs[k] - z_bar)
-        # publish ε_k = α_k ε^0_k
-        for k in range(m):
-            eps_by_copy[k][name] = cfg.alpha[k] * eps0_by_key[name][k].to("cpu")
+            # 发布噪声：ε_k = α_k ε^0_k
+            eps_by_copy[k][name] = (cfg.alpha[k] * eps0[k]).to(dtype=w.dtype)
 
     return eps_by_copy
+
 
 ##-----OK checked
 
@@ -457,24 +491,39 @@ class PUMTrainer:
     returns the parameter delta measured in the same space as the input.
     """
 
-    def __init__(self, model: nn.Module, cfg: PUMConfig):
+    def __init__(self, model: nn.Module, cfg: PUMConfig,*,
+        base_ref_sd: Mapping[str, torch.Tensor] | None = None,   #
+        task_vector_sd: Mapping[str, torch.Tensor] | None = None): # NEW)
         self.model = model
         self.cfg = cfg
         if cfg.verbose:
             logger.setLevel(logging.INFO)
-
+         # --- NEW:
+        self._start_sd = tree_like(model.state_dict())  #
+        if task_vector_sd is not None:
+            self._task_vec = task_vector_sd
+        elif base_ref_sd is not None:
+            # ：start_sd - base_llama3_sd
+            self._task_vec = tree_sub(self._start_sd, base_ref_sd)
+        else:
+            self._task_vec = None  # if cfg.sigma_ref="params" 
 
 
     def run_round(
         self,
         client_unlearn_fn: Callable[[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]],
-        round_idx: int | None = None,   # NEW: optional round index
+        round_idx: int | None = None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         cfg = self.cfg
         base_sd = self.model.state_dict()
 
-        # σ per layer (fixed strategy)
-        sigmas = compute_sigma_by_layer(base_sd, cfg)
+        # --- NEW:
+        if cfg.sigma_mode == "rms_kappa" and cfg.sigma_ref.lower() == "task_vector":
+            if self._task_vec is None:
+                raise ValueError("cfg.sigma_ref='task_vector', but no base_ref_sd or task_vector_sd。")
+            sigmas = compute_sigma_by_layer(base_sd, cfg, ref_map=self._task_vec)
+        else:
+            sigmas = compute_sigma_by_layer(base_sd, cfg)
 
         # ε_k (linearly dependent)
         eps_by_copy = generate_ld_noise_by_copy(base_sd, sigmas, cfg)
