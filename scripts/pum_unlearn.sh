@@ -133,15 +133,21 @@ PUM_ROTATE="${PUM_ROTATE:-true}"
 PUM_PERMUTE="${PUM_PERMUTE:-true}"
 PUM_RES_PERMUTE="${PUM_RES_PERMUTE:-false}"
 
+PUM_SIGMA_REF="${PUM_SIGMA_REF:-task_vector}"   # optional "params" 
+PUM_NOISE_GENERATOR="${PUM_NOISE_GENERATOR:-gaussian}"  # optional "uni" / "cos
+
 ##########################################
 # 10) 主循环：训练 + 评测
 ##########################################
+
+
 for split in "${SPLITS[@]}"; do
   forget_split=$(awk '{print $1}' <<< "$split")
   holdout_split=$(awk '{print $2}' <<< "$split")
   retain_split=$(awk '{print $3}' <<< "$split")
 
   for model in "${MODELS[@]}"; do
+    base_model_path="meta-llama/${model}"
     for te in "${TRAINERS_EXPERIMENTS[@]}"; do
       trainer=$(awk '{print $1}' <<< "$te")
       experiment=$(awk '{print $2}' <<< "$te")
@@ -205,7 +211,11 @@ for split in "${SPLITS[@]}"; do
           trainer.pum_cfg.seed_reparam="${PUM_SEED_REPARAM}" \
           trainer.pum_cfg.reparam_attention_rotate="${PUM_ROTATE}" \
           trainer.pum_cfg.reparam_ffn_pair_permute="${PUM_PERMUTE}" \
-          trainer.pum_cfg.reparam_residual_permute="${PUM_RES_PERMUTE}"
+          trainer.pum_cfg.reparam_residual_permute="${PUM_RES_PERMUTE}" \
+          +trainer.pum_cfg.sigma_ref="${PUM_SIGMA_REF}" \
+          +trainer.pum_cfg.base_model_name_or_path="${base_model_path}" \
+          +trainer.pum_cfg.noise_generator="${PUM_NOISE_GENERATOR}"
+
 
       fi
 
@@ -239,6 +249,7 @@ if [[ $RERUN_FLAG -eq 0 ]]; then
     retain_split=$(awk '{print $3}' <<< "$split")
 
     for model in "${MODELS[@]}"; do
+      base_model_path="meta-llama/${model}"
       for te in "${TRAINERS_EXPERIMENTS[@]}"; do
         trainer=$(awk '{print $1}' <<< "$te")
         experiment=$(awk '{print $2}' <<< "$te")
@@ -308,8 +319,10 @@ PY
             trainer.pum_cfg.seed_reparam="${PUM_SEED_REPARAM}" \
             trainer.pum_cfg.reparam_attention_rotate="${PUM_ROTATE}" \
             trainer.pum_cfg.reparam_ffn_pair_permute="${PUM_PERMUTE}" \
-            trainer.pum_cfg.reparam_residual_permute="${PUM_RES_PERMUTE}"
-
+            trainer.pum_cfg.reparam_residual_permute="${PUM_RES_PERMUTE}" \
+            +trainer.pum_cfg.sigma_ref="${PUM_SIGMA_REF}" \
+            +trainer.pum_cfg.base_model_name_or_path="${base_model_path}" \
+            +trainer.pum_cfg.noise_generator="${PUM_NOISE_GENERATOR}
 
           python "$EVAL_PY" \
             experiment=eval/tofu/default.yaml \

@@ -6,7 +6,7 @@ import logging
 from typing import Dict, List, Optional, Tuple
 from omegaconf import DictConfig, OmegaConf
 from transformers.trainer_utils import TrainOutput
-
+from transformers import AutoModelForCausalLM
 import torch
 
 from trainer.base import FinetuneTrainer
@@ -47,7 +47,35 @@ class PUM_LD(FinetuneTrainer):
             pum_cfg = OmegaConf.to_container(pum_cfg, resolve=True)
         assert isinstance(pum_cfg, dict), "pum_cfg must be a DictConfig or dict"
 
-        self._pum_engine = _PUMEngine(self.model, _PUMCfg(**pum_cfg))
+        # 取出 base 模型路径（不要传进 PUMConfig）
+        base_model_name_or_path = pum_cfg.pop("base_model_name_or_path", None)
+
+        # 构造 dataclass（里面已有 sigma_ref / noise_generator 等）
+        pcfg = _PUMCfg(**pum_cfg)
+
+        # 如需任务向量参考，则加载 base 权重并传给 PUMTrainer
+        if pcfg.sigma_ref.lower() == "task_vector":
+            if base_model_name_or_path is None:
+                raise ValueError(
+                    "sigma_ref='task_vector' 需要提供 pum_cfg.base_model_name_or_path"
+                )
+            base_model = AutoModelForCausalLM.from_pretrained(
+                base_model_name_or_path,
+                torch_dtype=torch.float32,
+                low_cpu_mem_usage=False,
+                trust_remote_code=True,
+            )
+            # 确保权重在 CPU 上
+            base_model.to("cpu")
+            base_sd = {k: v.detach().to("cpu") for k, v in base_model.state_dict().items()}
+            del base_model
+
+            self._pum_engine = _PUMEngine(self.model, pcfg, base_ref_sd=base_sd)
+        else:
+            self._pum_engine = _PUMEngine(self.model, pcfg)
+
+
+
         self._pum_local_steps = int(local_steps)
         self._pum_local_lr = float(local_lr)
 
