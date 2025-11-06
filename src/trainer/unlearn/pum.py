@@ -499,14 +499,40 @@ class PUMTrainer:
         if cfg.verbose:
             logger.setLevel(logging.INFO)
          # --- NEW:
-        self._start_sd = tree_like(model.state_dict())  #
+
+
+
+
+        # 仅抓取“可训练参数”的键，避免把 RoPE 缓存等 buffer 拉进来
+        param_keys = set(dict(model.named_parameters()).keys())
+        self._param_keys = param_keys
+
+        self._start_sd = tree_like(model.state_dict())
+        self._start_params = {k: self._start_sd[k] for k in param_keys}
+
         if task_vector_sd is not None:
-            self._task_vec = task_vector_sd
+            # 若直接给了任务向量，亦只保留参数子集
+            self._task_vec = {k: task_vector_sd[k] for k in param_keys if k in task_vector_sd}
+
         elif base_ref_sd is not None:
-            # ：start_sd - base_llama3_sd
-            self._task_vec = tree_sub(self._start_sd, base_ref_sd)
+            # 基座也裁成参数子集
+            base_ref_params = {k: base_ref_sd[k] for k in param_keys if k in base_ref_sd}
+
+            # 严格校验：参数必须齐全且形状一致（这一步不会触发 RoPE 缓存等问题）
+            missing = [k for k in param_keys if k not in base_ref_params]
+            if missing:
+                raise KeyError(f"Base model missing {len(missing)} parameter keys; e.g. {missing[:3]}")
+
+            bad = [k for k in param_keys if self._start_params[k].shape != base_ref_params[k].shape]
+            if bad:
+                raise ValueError(f"Task-vector shape mismatch on {len(bad)} parameter keys; e.g. "
+                                f"{[(k, tuple(self._start_params[k].shape), tuple(base_ref_params[k].shape)) for k in bad[:3]]}")
+
+            # 任务向量 = 仅参数子集的差
+            self._task_vec = tree_sub(self._start_params, base_ref_params)
         else:
-            self._task_vec = None  # if cfg.sigma_ref="params" 
+            self._task_vec = None  # 若 cfg.sigma_ref="params" 则无需
+
 
 
     def run_round(
@@ -518,12 +544,26 @@ class PUMTrainer:
         base_sd = self.model.state_dict()
 
         # --- NEW:
+        # 当前全量 state_dict（包含参数+缓冲区）
+        base_sd = self.model.state_dict()
+
         if cfg.sigma_mode == "rms_kappa" and cfg.sigma_ref.lower() == "task_vector":
             if self._task_vec is None:
-                raise ValueError("cfg.sigma_ref='task_vector', but no base_ref_sd or task_vector_sd。")
-            sigmas = compute_sigma_by_layer(base_sd, cfg, ref_map=self._task_vec)
+                raise ValueError("cfg.sigma_ref='task_vector' requires task vector; provide base_ref_sd or task_vector_sd.")
+            # 仅参数键：用任务向量估计逐层 σ
+            params_only = {k: base_sd[k] for k in self._param_keys}
+            sigmas_params = compute_sigma_by_layer(params_only, cfg, ref_map=self._task_vec)
+            # 回填到全量键：非参数键（例如 RoPE 缓存）σ=0（不加噪，不参与任务向量）
+            sigmas = {k: sigmas_params.get(k, 0.0) for k in base_sd.keys()}
+
         else:
-            sigmas = compute_sigma_by_layer(base_sd, cfg)
+            # 即使是 "params" 参考，也只对参数估计；非参数键 σ=0，避免动到缓存
+            params_only = {k: base_sd[k] for k in self._param_keys}
+            sigmas_params = compute_sigma_by_layer(params_only, cfg)
+            sigmas = {k: sigmas_params.get(k, 0.0) for k in base_sd.keys()}
+
+
+
 
         # ε_k (linearly dependent)
         eps_by_copy = generate_ld_noise_by_copy(base_sd, sigmas, cfg)

@@ -14,6 +14,8 @@ from trainer.base import FinetuneTrainer
 # NEW: PUM–LD engine (no clipping; α‑scaled, linearly dependent copies)
 from trainer.unlearn.pum import PUMTrainer as _PUMEngine, PUMConfig as _PUMCfg
 
+from huggingface_hub import snapshot_download
+from safetensors.torch import load_file as safe_load_file
 
 logger = logging.getLogger(__name__)
 
@@ -59,18 +61,46 @@ class PUM_LD(FinetuneTrainer):
                 raise ValueError(
                     "sigma_ref='task_vector' 需要提供 pum_cfg.base_model_name_or_path"
                 )
-            base_model = AutoModelForCausalLM.from_pretrained(
-                base_model_name_or_path,
-                torch_dtype=torch.float32,
-                low_cpu_mem_usage=False,
-                trust_remote_code=True,
-            )
-            # 确保权重在 CPU 上
-            base_model.to("cpu")
-            base_sd = {k: v.detach().to("cpu") for k, v in base_model.state_dict().items()}
-            del base_model
+                        # NEW: 避开 from_pretrained（会被 ZeRO-3 拦截成空分片），
+            # 直接把 safetensors/bin 权重加载为 CPU state_dict。
+            def _load_base_state_dict_cpu(path_or_repo: str) -> Dict[str, torch.Tensor]:
+                # 解析为本地目录；若是 Hub 仓库名则拉取到缓存
+                local_dir = path_or_repo
+                if not os.path.isdir(local_dir):
+                    local_dir = snapshot_download(
+                        path_or_repo,
+                        allow_patterns=[
+                            "model.safetensors",
+                            "model-*.safetensors",
+                            "pytorch_model.bin",
+                            "pytorch_model-*.bin",
+                        ],
+                    )
 
+                # 优先使用 safetensors 分片
+                st_files = sorted([f for f in os.listdir(local_dir) if f.endswith(".safetensors")])
+                state: Dict[str, torch.Tensor] = {}
+                if st_files:
+                    for fn in st_files:
+                        shard = safe_load_file(os.path.join(local_dir, fn), device="cpu")
+                        state.update(shard)
+                else:
+                    # 回退到 .bin 分片
+                    bin_files = sorted([f for f in os.listdir(local_dir) if f.endswith(".bin")])
+                    assert bin_files, f"No model weights found under {local_dir}"
+                    for fn in bin_files:
+                        shard = torch.load(os.path.join(local_dir, fn), map_location="cpu")
+                        state.update(shard)
+
+                # 统一保证 CPU 与独立存储
+                for k, v in list(state.items()):
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.detach().to("cpu")
+                return state
+
+            base_sd = _load_base_state_dict_cpu(base_model_name_or_path)
             self._pum_engine = _PUMEngine(self.model, pcfg, base_ref_sd=base_sd)
+
         else:
             self._pum_engine = _PUMEngine(self.model, pcfg)
 
